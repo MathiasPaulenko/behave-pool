@@ -16,7 +16,7 @@ def test_version_attribute() -> None:
     """behave_pool must expose __version__."""
     assert hasattr(behave_pool, "__version__")
     assert isinstance(behave_pool.__version__, str)
-    assert behave_pool.__version__ == "1.2.0"
+    assert behave_pool.__version__ == "1.3.0"
 
 
 def test_all_exports() -> None:

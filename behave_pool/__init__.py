@@ -14,7 +14,7 @@ Public API:
 
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 from behave_pool.runner import ParallelRunner
 from behave_pool.shard import ShardConfig, run_with_shard
