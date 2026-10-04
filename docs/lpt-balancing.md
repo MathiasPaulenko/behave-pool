@@ -80,7 +80,7 @@ discovery order (alphabetical by filename).
 
 ```bash
 # First run — no timing file, LPT has no effect
-behave --runner=parallel --parallel 4 features/
+behave-pool --parallel 4 features/
 
 # .behave-pool-timing.json is created with observed durations
 ```
@@ -103,7 +103,7 @@ On the next run, `behave-pool` sorts work units by their stored duration
 
 ```bash
 # Second run — LPT uses stored durations
-behave --runner=parallel --parallel 4 features/
+behave-pool --parallel 4 features/
 
 # checkout (10.2s) dispatched first, then search (7.1s), etc.
 ```
@@ -128,7 +128,7 @@ is stored for the next run.
 If you prefer insertion order (alphabetical by filename) over LPT:
 
 ```bash
-behave --runner=parallel --parallel 4 --parallel-balance fifo features/
+behave-pool --parallel 4 --parallel-balance fifo features/
 ```
 
 Or in `behave.ini`:
@@ -143,7 +143,7 @@ parallel-balance = fifo
 You can specify a custom location for the timing file:
 
 ```bash
-behave --runner=parallel --parallel 4 \
+behave-pool --parallel 4 \
     --parallel-timing-file .ci-timings.json \
     features/
 ```
@@ -169,7 +169,8 @@ The file is a JSON object mapping work unit IDs to durations in seconds:
 - **Keys**: Work unit IDs in the format `feature:<relative-path>`.
 - **Values**: Floating-point durations in seconds.
 - **Missing entries**: Default to `0.0` (treated as shortest).
-- **Corrupt entries**: Skipped with a warning log.
+- **Corrupt or non-finite entries**: Skipped with a warning log.
+- **Stale entries**: Units whose files no longer exist are pruned on save.
 
 ## Best practices
 
@@ -179,6 +180,5 @@ The file is a JSON object mapping work unit IDs to durations in seconds:
   at least twice before measuring wall-clock improvements.
 - **Use LPT for uneven suites** — if all features take roughly the same time,
   LPT and FIFO produce similar results. LPT shines when durations vary widely.
-- **Delete stale timings** — if you significantly refactor your test suite
-  (rename features, add/remove many scenarios), delete the timing file to
-  let it re-learn from scratch.
+- **Don't worry about stale entries** — entries for renamed or deleted
+  features are pruned automatically on the next save.

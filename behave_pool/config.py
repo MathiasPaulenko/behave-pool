@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from behave.configuration import Configuration
@@ -87,6 +87,40 @@ def _register_parallel_options() -> None:
 
 _register_parallel_options()
 
+# -- CONFIG-FILE OPTION NAMES (behave ini keys must match the option dest,
+#    i.e. underscores: "parallel_scheme", not "parallel-scheme").
+_USERDATA_PREFIX = "pool."
+
+
+def _userdata_get(config: Configuration, name: str) -> Any:
+    """Return ``userdata['pool.<name>']`` or None.
+
+    Behave's ``-D key=value`` / ``[behave.userdata]`` settings are parsed
+    before the runner class is loaded, so they are the only behave-pool
+    options reachable when using the plain ``behave`` command.
+    """
+    userdata = getattr(config, "userdata", None) or {}
+    get = getattr(userdata, "get", None)
+    if get is None:
+        return None
+    value = get(_USERDATA_PREFIX + name)
+    return value if isinstance(value, str) else None
+
+
+def _resolve_option(config: Configuration, attr: str, default: Any, userdata_name: str) -> Any:
+    """Resolve an option value: explicit config value > userdata > default.
+
+    A userdata override is only applied when the config attribute is unset
+    or still equals the registered default (i.e. the user did not provide
+    an explicit value via CLI flag or ini key).
+    """
+    value = getattr(config, attr, None)
+    if value is None or value == default:
+        override = _userdata_get(config, userdata_name)
+        if override is not None:
+            value = override
+    return default if value is None else value
+
 
 @dataclass(frozen=True)
 class ConfigSnapshot:
@@ -112,10 +146,26 @@ class ConfigSnapshot:
     total_shards: int | None = None
     dry_run: bool = False
     use_nested_step_modules: bool = False
+    tags: list[str] | str | None = None
+    config_tags: str | list[str] | None = None
+    default_tags: str | None = None
+    tag_expression_protocol: str | None = None
+    name: list[str] | None = None
+    userdata: dict[str, Any] = field(default_factory=dict)
 
 
 def snapshot_config(config: Configuration) -> ConfigSnapshot:
     """Create a picklable snapshot from a Configuration instance."""
+    tags = getattr(config, "tags", None)
+    if isinstance(tags, (list, tuple)):
+        tags = [str(t) for t in tags]
+    elif tags is not None:
+        tags = str(tags)
+    name = getattr(config, "name", None)
+    name_list = [str(n) for n in name] if isinstance(name, (list, tuple)) else None
+    userdata = getattr(config, "userdata", None) or {}
+    if not isinstance(userdata, dict):
+        userdata = {}
     return ConfigSnapshot(
         base_dir=str(getattr(config, "base_dir", None) or "features"),
         steps_dir=str(getattr(config, "steps_dir", None) or "steps"),
@@ -134,6 +184,12 @@ def snapshot_config(config: Configuration) -> ConfigSnapshot:
         total_shards=getattr(config, "total_shards", None),
         dry_run=config.dry_run,
         use_nested_step_modules=getattr(config, "use_nested_step_modules", False),
+        tags=tags,
+        config_tags=getattr(config, "config_tags", None),
+        default_tags=getattr(config, "default_tags", None),
+        tag_expression_protocol=getattr(config, "tag_expression_protocol", None),
+        name=name_list,
+        userdata=dict(userdata),
     )
 
 
@@ -141,32 +197,46 @@ def add_parallel_options(config: Configuration) -> None:
     """Add parallel-related attributes to a Configuration instance.
 
     Maps behave's ``config.jobs`` (from ``--parallel``/``--jobs``) to
-    ``config.parallel`` and ensures ``config.parallel_scheme`` exists.
+    ``config.parallel`` and resolves the behave-pool options.
+
+    Resolution order for each option:
+
+    1. Explicit config value (CLI flag or ini ``dest`` key — only
+       reachable when behave-pool's options were registered before
+       argument parsing, e.g. via the ``behave-pool`` command or
+       ``python -m behave_pool``).
+    2. ``userdata`` entry ``pool.<name>`` (works with plain ``behave``
+       via ``-D pool.balance=fifo`` or a ``[behave.userdata]`` section).
+    3. Registered default.
 
     Args:
         config: Behave Configuration instance to augment.
     """
     jobs = getattr(config, "jobs", 1)
-    if jobs is None:
-        jobs = 1
-    config.parallel = jobs
+    if jobs is None or jobs == 1:
+        userdata_jobs = _userdata_get(config, "jobs")
+        if userdata_jobs is not None:
+            import contextlib
 
-    if not hasattr(config, "parallel_scheme") or config.parallel_scheme is None:
-        config.parallel_scheme = "feature"
+            with contextlib.suppress(TypeError, ValueError):
+                jobs = int(str(userdata_jobs))
+    config.parallel = jobs if jobs else 1
 
-    if not hasattr(config, "parallel_balance") or config.parallel_balance is None:
-        config.parallel_balance = "lpt"
-
-    if not hasattr(config, "parallel_timing_file") or config.parallel_timing_file is None:
-        config.parallel_timing_file = ".behave-pool-timing.json"
-
-    if not hasattr(config, "parallel_report") or config.parallel_report is None:
-        config.parallel_report = "behave-pool-report.json"
+    config.parallel_scheme = _resolve_option(config, "parallel_scheme", "feature", "scheme")
+    config.parallel_balance = _resolve_option(config, "parallel_balance", "lpt", "balance")
+    config.parallel_timing_file = _resolve_option(
+        config, "parallel_timing_file", ".behave-pool-timing.json", "timing_file"
+    )
+    config.parallel_report = _resolve_option(
+        config, "parallel_report", "behave-pool-report.json", "report"
+    )
 
     if not hasattr(config, "use_nested_step_modules"):
         config.use_nested_step_modules = False
 
     shard_value = getattr(config, "shard", None)
+    if shard_value is None:
+        shard_value = _userdata_get(config, "shard")
     if shard_value is not None:
         from behave_pool.shard import parse_shard_string
 

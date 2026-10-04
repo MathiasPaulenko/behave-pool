@@ -30,37 +30,61 @@ cd behave-pool
 pip install -e ".[dev]"
 ```
 
-## Register the runner
+## The `behave-pool` command
 
-`behave-pool` implements Behave's `ITestRunner` interface. You need to register
-it so Behave knows how to load it.
+The package installs a `behave-pool` executable — a drop-in behave
+wrapper that registers the extra `--parallel-*` and `--shard` options
+*before* behave parses the command line and selects `ParallelRunner`
+automatically:
 
-### Option A: `behave.ini`
+```bash
+behave-pool --parallel 4 features/
+```
 
-Create or edit `behave.ini` in your project root:
+`python -m behave_pool` is equivalent. All standard behave options keep
+working.
+
+!!! note "Why a wrapper?"
+    Behave parses arguments and the config file *before* it loads the
+    runner class, so runner-provided CLI options cannot be registered
+    from inside the runner. The `behave-pool` command imports the
+    package first, which makes the custom options available during
+    parsing.
+
+## Using plain `behave`
+
+If you prefer the plain `behave` command, register the runner and set
+the worker count in `behave.ini`:
+
+```ini
+[behave]
+jobs = 4
+runner = behave_pool:ParallelRunner
+```
+
+Then:
+
+```bash
+behave features/
+```
+
+Or map an alias and pass it on the command line:
 
 ```ini
 [behave.runners]
 parallel = behave_pool:ParallelRunner
 ```
 
-### Option B: `setup.cfg` / `pyproject.toml` (entry point)
-
-If you distribute your test suite as a package, add the entry point in your
-`pyproject.toml`:
-
-```toml
-[project.entry-points."behave.runners"]
-parallel = "behave_pool:ParallelRunner"
-```
-
-### Option C: Command-line `--runner`
-
-You can skip registration entirely and pass the runner inline:
-
 ```bash
-behave --runner=behave_pool:ParallelRunner --parallel 4 features/
+behave --runner=parallel --parallel 4 features/
 ```
+
+With plain `behave`, the pool options (`parallel_scheme`,
+`parallel_balance`, `parallel_timing_file`, `parallel_report`, `shard`)
+cannot be used as ini keys — behave ignores unknown keys during config
+parsing. Use `[behave.userdata]` entries (`pool.scheme`, `pool.balance`,
+`pool.timing_file`, `pool.report`, `pool.shard`, `pool.jobs`) or `-D`
+flags instead — see [Configuration](configuration.md).
 
 ## Your first parallel run
 
@@ -69,17 +93,15 @@ Make sure you have a `features/` directory with at least two `.feature` files.
 === "bash"
 
     ```bash
-    behave --runner=parallel --parallel 4 features/
+    behave-pool --parallel 4 features/
     ```
 
 === "behave.ini"
 
     ```ini
     [behave]
-    parallel = 4
-
-    [behave.runners]
-    parallel = behave_pool:ParallelRunner
+    jobs = 4
+    runner = behave_pool:ParallelRunner
     ```
 
     Then simply run:
@@ -91,8 +113,9 @@ Make sure you have a `features/` directory with at least two `.feature` files.
 ### What happens?
 
 1. `ParallelRunner` parses all `.feature` files in `features/`.
-2. It creates one `WorkUnit` per feature file.
-3. It launches 4 worker processes (using `spawn` start method).
+2. It creates one `WorkUnit` per feature file — two for features that
+   mix `@serial` and non-serial scenarios.
+3. It launches up to 4 worker processes (using `spawn` start method).
 4. Each worker consumes work units from a shared queue.
 5. Results are collected and aggregated.
 6. A `.behave-pool-timing.json` file is created with observed durations.
@@ -100,17 +123,15 @@ Make sure you have a `features/` directory with at least two `.feature` files.
 ### Output example
 
 ```
-Feature: Login functionality
-  Scenario: User logs in with valid credentials ... passed
-  Scenario: User logs in with invalid credentials ... passed
-
-Feature: Checkout flow
-  Scenario: Add item to cart ... passed
-  Scenario: Complete purchase ... passed
-
-2 features passed, 0 failed, 0 skipped
-4 scenarios passed, 0 failed, 0 skipped
+USING RUNNER: behave_pool.runner:ParallelRunner
+feature:features/login.feature ... passed (0.32s)
+feature:features/checkout.feature ... passed (0.45s)
+2 features, 4 scenarios, 12 steps - passed: 12, failed: 0, skipped: 0, undefined: 0
 ```
+
+One progress line is printed per finished work unit, followed by an
+aggregate summary. `--format`/`--outfile` formatters are not wired up in
+parallel mode — use `--parallel-report` for machine-readable output.
 
 ## Choosing the number of workers
 
@@ -121,7 +142,7 @@ A good starting point is the number of CPU cores:
 python -c "import os; print(os.cpu_count())"
 
 # Use that many workers
-behave --runner=parallel --parallel 8 features/
+behave-pool --parallel 8 features/
 ```
 
 !!! tip "Rule of thumb"

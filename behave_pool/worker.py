@@ -111,9 +111,20 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
                 [unit.feature_path],
                 language=self.config.lang,
             )
+            if unit.serial_mode != "all":
+                from behave_pool.serial import filter_serial_scenarios
+
+                for feature in self.features:
+                    filter_serial_scenarios(feature, unit.serial_mode)
+            if unit.scenario_line is not None:
+                from behave_pool.serial import filter_scenario_by_line
+
+                for feature in self.features:
+                    filter_scenario_by_line(feature, unit.scenario_line)
             self.undefined_steps.clear()
             self.hook_failures = 0
             if self.context is not None:
+                # aborted lives on the Context created in setup()
                 self.aborted = False
             failed = self._run_features()
             duration = time.perf_counter() - start
@@ -242,7 +253,7 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
         return {
             "id": f"step-{id(step):x}",
             "keyword": str(getattr(step, "keyword", "")),
-            "text": str(getattr(step, "name", "") or getattr(step, "text", "")),
+            "text": str(getattr(step, "name", "") or ""),
             "status": self._map_status(getattr(step, "status", "passed")),
             "duration": float(getattr(step, "duration", 0.0) or 0.0),
             "location": self._serialize_location(step),
@@ -264,8 +275,11 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
 
     def _serialize_scenario(self, scenario: Any, feature_id: str) -> dict[str, Any]:
         """Convert a Behave Scenario to a behave-modern-json-report scenario dict."""
+        # NOTE: use scenario.steps, not all_steps — all_steps also contains
+        # the background steps, which are serialized via feature.background
+        # and would otherwise be counted twice.
         steps = []
-        for step in getattr(scenario, "all_steps", None) or getattr(scenario, "steps", []) or []:
+        for step in getattr(scenario, "steps", None) or []:
             steps.append(self._serialize_step(step))
         scenario_type = str(getattr(scenario, "type", "") or "")
         is_outline = scenario_type in ("scenario_outline", "outline")
@@ -294,9 +308,21 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
         ExecutionReport schema so downstream tools can consume it directly.
         """
         feature_id = f"feature-{id(feature):x}"
-        scenarios = []
-        for scenario in getattr(feature, "scenarios", None) or []:
-            scenarios.append(self._serialize_scenario(scenario, feature_id))
+        # Walk run_items so ScenarioOutlines contribute their expanded
+        # example scenarios (with real statuses), not the untested template
+        # that appears in feature.scenarios.
+        from behave.model import Rule, ScenarioOutline
+
+        def _iter_scenarios(container: Any) -> Any:
+            for item in getattr(container, "run_items", None) or []:
+                if isinstance(item, Rule):
+                    yield from _iter_scenarios(item)
+                elif isinstance(item, ScenarioOutline):
+                    yield from item.scenarios
+                else:
+                    yield item
+
+        scenarios = [self._serialize_scenario(s, feature_id) for s in _iter_scenarios(feature)]
         background = None
         behave_background = getattr(feature, "background", None)
         if behave_background:
@@ -368,6 +394,24 @@ def _make_config(snapshot: ConfigSnapshot) -> Configuration:
     config.parallel_balance = snapshot.parallel_balance
     config.parallel_timing_file = snapshot.parallel_timing_file
     config.parallel_report = snapshot.parallel_report
+
+    # -- SELECTION FILTERS: rebuild tag-expression, name pattern and
+    #    userdata so --tags/--name/-D behave the same inside workers.
+    config.tags = snapshot.tags
+    config.config_tags = snapshot.config_tags
+    config.default_tags = snapshot.default_tags
+    from behave.tag_expression import TagExpressionProtocol
+
+    if isinstance(snapshot.tag_expression_protocol, TagExpressionProtocol):
+        config.tag_expression_protocol = snapshot.tag_expression_protocol
+    config.setup_tag_expression()
+    if snapshot.name:
+        config.name = list(snapshot.name)
+        config.name_re = Configuration.build_name_re(config.name)
+    if snapshot.userdata:
+        from behave.userdata import UserData
+
+        config.userdata = UserData(dict(snapshot.userdata))
     return config
 
 
@@ -425,6 +469,9 @@ def _worker_run_loop(
             result = runner.run_work_unit(unit)
             result_queue.put(result)
             task_queue.task_done()
+            if result.failed and config.stop:
+                # -- STOP-ON-FAILURE: propagate --stop to other workers.
+                stop_event.set()
             if runner.aborted:
                 stop_event.set()
                 logger.warning(

@@ -50,13 +50,25 @@ from behave_pool.config import ConfigSnapshot
 
 unit = WorkUnit(
     id="feature:features/login.feature",
-    config=ConfigSnapshot(base_dir="features", steps_dir="steps"),
+    config=ConfigSnapshot(
+        base_dir="features",
+        steps_dir="steps",
+        environment_file="environment.py",
+        lang=None,
+        stop=False,
+    ),
     feature_path="features/login.feature",
     tags=["serial"],
+    serial_mode="only",
 )
 
 print(unit.is_serial)  # True
 ```
+
+`serial_mode` selects which scenarios of a feature the unit executes:
+`"all"` (default), `"only"` (`@serial` scenarios), or `"exclude"`
+(everything except `@serial`). Mixed features are split by the planner
+into a `"exclude"` parallel unit and a `"only"` serial unit.
 
 ::: behave_pool.work_unit
 
@@ -164,3 +176,17 @@ These classes are used internally by `ParallelRunner` and are not typically
 instantiated directly by end users.
 
 ::: behave_pool.worker
+
+## Serial detection
+
+Shared helpers used by both the coordinator (planning) and the workers
+(execution) to identify `@serial` scenarios consistently.
+
+::: behave_pool.serial
+
+## CLI
+
+The `behave-pool` console entry point — a behave wrapper that registers
+the pool options before argument parsing.
+
+::: behave_pool.cli

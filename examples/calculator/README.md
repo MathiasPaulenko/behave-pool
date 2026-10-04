@@ -21,17 +21,20 @@ From the `examples/calculator` directory:
 # Install behave-pool (if not already installed)
 pip install behave-pool
 
-# Run with 4 parallel workers
-behave --runner=parallel --parallel 4
+# Run with 4 parallel workers (behave-pool is a behave wrapper)
+behave-pool --parallel 4
 
-# Run with FIFO ordering instead of LPT
-behave --runner=parallel --parallel 4 --parallel-balance fifo
+# The included behave.ini already sets jobs=4, so plain behave works too:
+behave
 ```
 
 ## What to expect
 
-- The first two scenarios run in parallel across worker processes.
-- The `@serial` tagged scenario runs sequentially after all parallel work
-  units complete.
+- The two non-serial scenarios run inside the parallel work unit, in
+  parallel with other features' work units.
+- The `@serial` scenario runs sequentially after all parallel work
+  units complete (the feature is split into a parallel unit and a
+  serial unit).
 - A `.behave-pool-timing.json` file is created to store durations for
   LPT scheduling on subsequent runs.
+- A `behave-pool-report.json` unified report is written.

@@ -6,15 +6,30 @@ exclusive resources, or have side effects that would conflict with other tests.
 
 ## How it works
 
-When `behave-pool` encounters a feature file containing `@serial`-tagged
-scenarios, it:
+`@serial` applies at **scenario granularity**:
 
-1. **Parallel phase** — Runs all non-serial features across N worker processes.
-2. **Serial phase** — After all parallel workers complete, runs `@serial`
-   features one at a time in a single worker process.
+- A feature with **no** `@serial` produces one parallel work unit.
+- A feature tagged `@serial` at feature level produces one serial work
+  unit (all its scenarios run serially).
+- A feature **mixing** serial and non-serial scenarios is split into two
+  work units: a parallel unit running only the non-serial scenarios, and
+  a `<feature>#serial` unit running only the `@serial` scenarios.
 
-This ensures serial scenarios never run concurrently with each other or with
-parallel work.
+The run then has two phases:
+
+1. **Parallel phase** — All non-serial work units across N worker processes.
+2. **Serial phase** — After all parallel workers complete, the serial
+   work units run one at a time in a single worker process.
+
+This ensures serial scenarios never run concurrently with each other or
+with parallel work.
+
+!!! note "With `--parallel-scheme scenario`"
+    The description above applies to the default `feature` scheme. Under
+    `scenario` scheme each run item becomes its own work unit, so a
+    `@serial` scenario is a serial unit on its own (no `#serial` split
+    needed). A ScenarioOutline is a single unit: if only some of its
+    example rows are `@serial`, the whole outline runs serially.
 
 ## Tagging scenarios
 
@@ -84,8 +99,11 @@ Feature: Order processing
     Then the email should be sent
 ```
 
-Serial scenarios run **one at a time** in the order they appear in the feature
-file. "Process payment" runs first, then "Send confirmation email".
+Both serial scenarios are grouped into the feature's `#serial` work unit
+and run **one at a time**, in file order: "Process payment" first, then
+"Send confirmation email". Across features, serial work units run in the
+planned dispatch order (LPT by default, or FIFO with
+`--parallel-balance fifo`).
 
 ## Execution order
 
@@ -100,18 +118,17 @@ file. "Process payment" runs first, then "Send confirmation email".
 │  └─────────┘ └─────────┘ └─────────┘ └─────────┘    │
 │                                                       │
 │  Phase 2: SERIAL (after all workers finish)           │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐                │
-│  │ Serial 1 │ → │ Serial 2 │ → │ Serial 3 │                │
-│  │ (worker) │   │ (worker) │   │ (worker) │                │
-│  └─────────┘ └─────────┘ └─────────┘                │
+│  ┌──────────────────────────────────────────┐        │
+│  │ 1 worker: serial unit 1 → unit 2 → ...    │        │
+│  └──────────────────────────────────────────┘        │
 └──────────────────────────────────────────────────────┘
 ```
 
 !!! important "Serial phase only starts after parallel phase"
     If any parallel worker fails, the serial phase still runs. This ensures
-    cleanup scenarios (e.g., `@serial` teardown) always execute. However,
-    if the `stop_event` is set (e.g., due to a worker crash), the serial
-    phase is skipped.
+    cleanup scenarios (e.g., `@serial` teardown) always execute. The serial
+    phase is only skipped when the `stop_event` is set — i.e. `--stop` after
+    a failure, a worker timeout, or a worker abort.
 
 ## Combining with other tags
 
@@ -129,11 +146,14 @@ You can use Behave's `--tags` filtering alongside `@serial`:
 
 ```bash
 # Run only serial scenarios
-behave --runner=parallel --parallel 4 --tags=@serial features/
+behave-pool --parallel 4 --tags=@serial features/
 
-# Exclude serial scenarios from parallel run
-behave --runner=parallel --parallel 4 --tags=~@serial features/
+# Exclude serial scenarios from the run
+behave-pool --parallel 4 --tags="not @serial" features/
 ```
+
+`--tags`/`--name` filters are propagated to every worker, so excluded
+scenarios are skipped inside each work unit.
 
 ## Common use cases
 

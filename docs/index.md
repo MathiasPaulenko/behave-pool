@@ -22,6 +22,7 @@ suites grow, wall-clock time becomes a bottleneck. `behave-pool` solves this by:
 ## Features
 
 - **Native ITestRunner** — Registered via `--runner=` or `behave.ini`. Zero monkey-patching.
+- **Two granularities** — `--parallel-scheme feature` (one unit per file) or `scenario` (one unit per scenario/outline).
 - **Process isolation** — `spawn` start method ensures clean state in every worker, on every OS.
 - **Dynamic dispatch** — `multiprocessing.Process` + `Queue`. Workers consume work units as they finish.
 - **@serial tag** — Non-parallelizable scenarios run sequentially after the parallel phase.
@@ -38,17 +39,18 @@ suites grow, wall-clock time becomes a bottleneck. `behave-pool` solves this by:
 pip install behave-pool
 ```
 
-Register the runner in `behave.ini`:
-
-```ini
-[behave.runners]
-parallel = behave_pool:ParallelRunner
-```
-
-Run Behave with parallel workers:
+Run the suite with 4 parallel workers:
 
 ```bash
-behave --runner=parallel --parallel 4 --parallel-scheme feature features/
+behave-pool --parallel 4 features/
+```
+
+Or register the runner in `behave.ini` and use plain `behave`:
+
+```ini
+[behave]
+jobs = 4
+runner = behave_pool:ParallelRunner
 ```
 
 ## How it works
@@ -58,10 +60,10 @@ behave --runner=parallel --parallel 4 --parallel-scheme feature features/
 │                  ParallelRunner                  │
 │                                                  │
 │  1. Plan    — parse features, create work units  │
-│  2. Split   — separate @serial from parallel     │
-│  3. Dispatch — N workers consume from queue      │
-│  4. Collect — gather results, update timings     │
-│  5. Serial  — run @serial units one at a time    │
+│  2. Shard   — select shard slice (if --shard)    │
+│  3. Split   — separate @serial from parallel     │
+│  4. Dispatch — N parallel workers, then 1 serial │
+│  5. Collect — gather results, update timings     │
 └─────────────────────────────────────────────────┘
          │                          │
     ┌────▼────┐               ┌────▼────┐

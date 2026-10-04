@@ -91,11 +91,15 @@ A frozen dataclass representing a single unit of test work.
 
 **Fields:**
 
-- `id` — Unique identifier (e.g., `feature:features/login.feature`).
+- `id` — Unique identifier (e.g., `feature:features/login.feature` or
+  `feature:features/login.feature#serial` for the serial half of a mixed
+  feature).
 - `config` — `ConfigSnapshot` with picklable configuration.
 - `feature_path` — Path to the `.feature` file.
-- `scenario_line` — Line number for scenario-level units (currently always `None`).
+- `scenario_line` — Declaration line of the scenario/outline for units produced by `--parallel-scheme scenario`; `None` for feature-level units.
 - `tags` — Tags from the feature and its scenarios.
+- `serial_mode` — `"all"` (default), `"only"` or `"exclude"`: which
+  scenarios of the feature this unit executes.
 - `is_serial` — Property: `True` if `"serial"` is in `tags`.
 
 ### WorkerResult
@@ -134,9 +138,12 @@ Loads and saves historical work unit durations as JSON. Used by
 ### WorkUnitIterator
 
 Abstract strategy for generating `WorkUnit` objects from parsed features.
-Currently one implementation:
+Two implementations:
 
-- `FeatureIterator` — One `WorkUnit` per feature file.
+- `FeatureIterator` — One `WorkUnit` per feature file (a feature mixing
+  `@serial` and non-serial scenarios is split into two units).
+- `ScenarioIterator` — One `WorkUnit` per scenario run item (a whole
+  ScenarioOutline is one unit).
 
 ## Execution pipeline
 
@@ -145,7 +152,9 @@ Currently one implementation:
 ```python
 feature_locations = [f for f in self.feature_locations() if not self.config.exclude(f)]
 features = parse_features(feature_locations, language=self.config.lang)
-iterator = WorkUnitIterator.for_scheme(scheme="feature", features=features, config=self.config)
+iterator = WorkUnitIterator.for_scheme(
+    scheme=self.config.parallel_scheme, features=features, config=self.config
+)
 work_units = list(iterator.iterate())
 work_units = self._sort_by_duration(work_units)  # LPT or FIFO
 ```
@@ -167,18 +176,25 @@ Work units tagged `@serial` are separated for the serial phase.
 **Phase 1 — Parallel:**
 
 1. Enqueue all parallel work units into `task_queue`.
-2. Enqueue `N` `None` sentinels (one per worker) to signal termination.
-3. Launch `N` `WorkerProcess` instances with `spawn` start method.
+2. Enqueue `min(N, len(batch))` `None` sentinels (one per worker).
+3. Launch `min(N, len(batch))` `WorkerProcess` instances — never more
+   workers than there is work.
 4. Each worker runs `_worker_run_loop`: `setup()` → loop(`get`, `run`, `put`) → `teardown()`.
-5. `join()` each worker with a 300-second timeout.
-6. If a worker is still alive after timeout, set `stop_event` and `terminate()`.
+5. The coordinator collects results **while dispatching**; each work
+   unit may take up to 300 seconds — the clock restarts with every
+   received result. On timeout the workers are terminated and the
+   remaining units count as missing (failed).
+6. If `config.stop` is set (`--stop`), the first failed result sets
+   `stop_event` so workers drop all queued units.
+7. After all results are in, workers get a 30-second grace period to
+   exit before being terminated.
 
 **Phase 2 — Serial:**
 
 1. If `stop_event` is not set and there are serial work units:
-2. Enqueue serial work units one at a time.
-3. Launch a single `WorkerProcess`.
-4. `join()` with 300-second timeout.
+2. Enqueue all serial work units plus one sentinel.
+3. Launch a single `WorkerProcess` and collect results the same way
+   (300s per unit, not per phase).
 
 ### Step 4: Collect (`_collect`)
 
@@ -256,9 +272,25 @@ and when a worker times out.
 
 | Component | Timeout | Behavior |
 | --- | --- | --- |
-| Worker `join()` | 300s | `stop_event.set()` + `terminate()` |
-| Result queue `get()` | 1s (loop) | Retries until 30s deadline |
+| Work unit | 300s per result | `stop_event.set()` + workers terminated |
+| Worker shutdown | 30s | `join()` grace period, then `terminate()` |
 | Collect deadline | 30s | Stops waiting for missing results |
 
 Missing results (worker crashed before sending a result) are treated as
 failures.
+
+## Caveats
+
+- **Hooks run per worker.** `before_all`/`after_all` (and the other
+  environment hooks) execute once *per worker process*, not once per
+  run. If `environment.py` manages global resources (ports, containers,
+  shared files), make those hooks idempotent or move the resource behind
+  a `@serial` scenario.
+- **Daemon workers.** Worker processes are created with
+  `daemon=True`, so they cannot spawn child processes themselves —
+  `multiprocessing` inside step definitions will fail with
+  `AssertionError: daemonic processes are not allowed to have children`.
+- **No formatters in parallel mode.** `--format`/`--outfile` are not
+  wired into workers; console output is one line per finished work unit
+  plus an aggregate summary, and `--parallel-report` produces the
+  machine-readable report.

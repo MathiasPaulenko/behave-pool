@@ -2,51 +2,32 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from behave.model import Feature, Scenario
+from behave.model import Feature
 
 from behave_pool.config import ConfigSnapshot
 from behave_pool.shard import (
     ShardConfig,
     ShardError,
-    collect_scenarios,
     parse_shard_string,
     select_shard_work_units,
-    sort_scenarios,
     split_shards,
     validate_shard,
 )
 from behave_pool.work_unit import WorkUnit
 
-FIXTURES_DIR = str(Path(__file__).parent.parent / "fixtures" / "simple" / "features")
-
 
 def _make_feature(
     filename: str,
     name: str | None = None,
-    scenarios: list[Scenario] | None = None,
 ) -> Feature:
-    feature = Feature(
+    return Feature(
         filename=filename,
         line=1,
         keyword="Feature",
         name=name or filename,
-        tags=[],
-    )
-    if scenarios:
-        feature.scenarios = scenarios
-    return feature
-
-
-def _make_scenario(name: str, line: int = 0) -> Scenario:
-    return Scenario(
-        filename="",
-        line=line,
-        keyword="Scenario",
-        name=name,
         tags=[],
     )
 
@@ -208,63 +189,6 @@ class TestSplitShards:
             split_shards([1, 2, 3], 1, 0)
 
 
-# ── sort_scenarios ──────────────────────────────────────────────────
-
-
-class TestSortScenarios:
-    def test_sorts_by_feature_name_then_scenario_name(self) -> None:
-        f1 = _make_feature("a.feature", name="Zeta")
-        f2 = _make_feature("b.feature", name="Alpha")
-        s1 = _make_scenario("Scenario B")
-        s2 = _make_scenario("Scenario A")
-        pairs = [(f1, s1), (f2, s2)]
-        sorted_pairs = sort_scenarios(pairs)
-        assert sorted_pairs[0][0].name == "Alpha"
-        assert sorted_pairs[1][0].name == "Zeta"
-
-    def test_same_feature_sorts_by_scenario_name(self) -> None:
-        f = _make_feature("a.feature", name="Login")
-        s1 = _make_scenario("Zebra")
-        s2 = _make_scenario("Apple")
-        pairs = [(f, s1), (f, s2)]
-        sorted_pairs = sort_scenarios(pairs)
-        assert sorted_pairs[0][1].name == "Apple"
-        assert sorted_pairs[1][1].name == "Zebra"
-
-    def test_empty_list(self) -> None:
-        assert sort_scenarios([]) == []
-
-    def test_preserves_duplicates(self) -> None:
-        f = _make_feature("a.feature", name="F")
-        s = _make_scenario("S")
-        pairs = [(f, s), (f, s)]
-        sorted_pairs = sort_scenarios(pairs)
-        assert len(sorted_pairs) == 2
-
-
-# ── collect_scenarios ───────────────────────────────────────────────
-
-
-class TestCollectScenarios:
-    def test_collects_from_simple_fixtures(self) -> None:
-        pairs = collect_scenarios(FIXTURES_DIR)
-        assert len(pairs) > 0
-        for feature, scenario in pairs:
-            assert hasattr(feature, "name")
-            assert hasattr(scenario, "name")
-
-    def test_returns_feature_scenario_tuples(self) -> None:
-        pairs = collect_scenarios(FIXTURES_DIR)
-        for feature, scenario in pairs:
-            assert isinstance(feature, Feature)
-            assert isinstance(scenario, Scenario)
-
-    def test_empty_directory(self, tmp_path: Path) -> None:
-        empty_dir = str(tmp_path / "empty")
-        Path(empty_dir).mkdir()
-        assert collect_scenarios(empty_dir) == []
-
-
 # ── select_shard_work_units ─────────────────────────────────────────
 
 
@@ -295,13 +219,22 @@ class TestSelectShardWorkUnits:
         assert shard1.isdisjoint(shard3)
         assert shard2.isdisjoint(shard3)
 
-    def test_deterministic_ordering(self) -> None:
+    def test_deterministic_selection(self) -> None:
         units = [_make_work_unit(f"feature:{c}.feature") for c in "abcdefghij"]
-        # Reversed input should still produce the same shard selection
+        # Reversed input must produce the same shard membership (the
+        # returned order follows the input order, e.g. LPT balancing).
         reversed_units = list(reversed(units))
         shard1_a = select_shard_work_units(units, 1, 3)
         shard1_b = select_shard_work_units(reversed_units, 1, 3)
-        assert [u.id for u in shard1_a] == [u.id for u in shard1_b]
+        assert {u.id for u in shard1_a} == {u.id for u in shard1_b}
+
+    def test_input_order_preserved(self) -> None:
+        """Selection preserves the incoming order (LPT) inside the shard."""
+        units = [_make_work_unit(f"feature:{c}.feature") for c in "abcdefghij"]
+        reversed_units = list(reversed(units))
+        shard1 = select_shard_work_units(reversed_units, 1, 3)
+        expected_order = [u.id for u in reversed_units if u in shard1]
+        assert [u.id for u in shard1] == expected_order
 
     def test_empty_units(self) -> None:
         assert select_shard_work_units([], 1, 3) == []
@@ -410,7 +343,7 @@ class TestRunnerShardIntegration:
             runner._apply_shard(units)
             mock_logger.info.assert_called_once()
             call_args = mock_logger.info.call_args
-            assert call_args[0][0] == "Shard %d/%d — %d scenarios selected (of %d total)"
+            assert call_args[0][0] == "Shard %d/%d - %d work units selected (of %d total)"
             assert call_args[0][1:] == (2, 3, 3, 10)
 
     def test_filter_features_by_shard(self, mock_config: MagicMock) -> None:
@@ -442,7 +375,7 @@ class TestRunnerShardIntegration:
             runner._log_shard_info(4, total=10)
             mock_logger.info.assert_called_once()
             call_args = mock_logger.info.call_args
-            assert call_args[0][0] == "Shard %d/%d — %d scenarios selected (of %d total)"
+            assert call_args[0][0] == "Shard %d/%d - %d work units selected (of %d total)"
             assert call_args[0][1:] == (1, 3, 4, 10)
 
     def test_log_shard_info_without_total(self, mock_config: MagicMock) -> None:
@@ -455,7 +388,7 @@ class TestRunnerShardIntegration:
             runner._log_shard_info(3)
             mock_logger.info.assert_called_once()
             call_args = mock_logger.info.call_args
-            assert call_args[0][0] == "Shard %d/%d — %d features selected"
+            assert call_args[0][0] == "Shard %d/%d - %d features selected"
             assert call_args[0][1:] == (2, 3, 3)
 
     def test_log_shard_info_noop_when_no_shard(self, mock_config: MagicMock) -> None:
@@ -731,22 +664,6 @@ class TestRunWithShardConfig:
             else:
                 # First positional arg is command_args
                 assert args[0] is not None
-
-
-class TestSortScenariosNoneNames:
-    """Regression: sort_scenarios must handle None feature/scenario names."""
-
-    def test_none_feature_name_does_not_crash(self) -> None:
-        f = _make_feature("a.feature", name="")  # name is empty string, not None
-        s = _make_scenario("S")
-        result = sort_scenarios([(f, s)])
-        assert len(result) == 1
-
-    def test_none_scenario_name_does_not_crash(self) -> None:
-        f = _make_feature("a.feature", name="F")
-        s = Scenario(filename="", line=0, keyword="Scenario", name="", tags=[])
-        result = sort_scenarios([(f, s)])
-        assert len(result) == 1
 
 
 class TestShardSortingConsistency:

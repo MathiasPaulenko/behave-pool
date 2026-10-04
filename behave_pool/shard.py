@@ -1,18 +1,23 @@
 """Sharding support for CI parallelism across multiple machines.
 
-Sharding divides the total scenario list into ``total_shards`` contiguous
-groups.  Each CI runner executes only its assigned shard (``shard_index``).
+Sharding divides the work units (one per feature file, plus the extra
+``#serial`` units produced by mixed features) into ``total_shards``
+contiguous groups.  Each CI runner executes only its assigned shard
+(``shard_index``).
 
 The algorithm:
 
-1. Parse all scenarios from the features directory using behave-model.
-2. Sort deterministically by ``feature.name`` → ``scenario.name``.
+1. Build the work units from the parsed features.
+2. Sort a copy deterministically by work unit ``id`` (i.e. feature path)
+   to compute shard membership identically on every machine.
 3. Split the sorted list into ``total_shards`` groups.  The first
-   ``len % total_shards`` shards receive one extra scenario.
-4. Execute only the ``shard_index``-th group (1-based).
+   ``len % total_shards`` shards receive one extra unit.
+4. Return the ``shard_index``-th group (1-based) in the original input
+   order, so the planned LPT/FIFO order is preserved.
 
-Sharding composes with ``--parallel`` (local parallelism within a shard)
-and ``@serial`` (serial scenarios within a shard run sequentially).
+Sharding composes with ``--parallel`` (local parallelism within a shard),
+``--parallel-balance`` (ordering is preserved inside the shard), and
+``@serial`` (serial work units within a shard run sequentially).
 """
 
 from __future__ import annotations
@@ -22,11 +27,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
 from behave.exception import ConfigError
-from behave.runner import parse_features
 
 if TYPE_CHECKING:
-    from behave.model import Feature, Scenario
-
     from behave_pool.work_unit import WorkUnit
 
 T = TypeVar("T")
@@ -108,49 +110,6 @@ def validate_shard(shard_index: int, total_shards: int) -> None:
         raise ShardError(msg)
 
 
-def collect_scenarios(features_dir: str) -> list[tuple[Feature, Scenario]]:
-    """Parse all scenarios from a features directory.
-
-    Args:
-        features_dir: Path to the directory containing ``.feature`` files.
-
-    Returns:
-        A list of ``(feature, scenario)`` tuples in parse order.
-    """
-    from pathlib import Path
-
-    base = Path(features_dir)
-    feature_files = sorted(base.rglob("*.feature"))
-    features = parse_features(
-        [str(f) for f in feature_files],
-    )
-    result: list[tuple[Feature, Scenario]] = []
-    for feature in features:
-        for scenario in getattr(feature, "scenarios", None) or []:
-            result.append((feature, scenario))
-    return result
-
-
-def sort_scenarios(
-    pairs: list[tuple[Feature, Scenario]],
-) -> list[tuple[Feature, Scenario]]:
-    """Sort scenario pairs deterministically by feature name then scenario name.
-
-    Args:
-        pairs: List of ``(feature, scenario)`` tuples.
-
-    Returns:
-        Sorted list.
-    """
-    return sorted(
-        pairs,
-        key=lambda pair: (
-            getattr(pair[0], "name", None) or "",
-            getattr(pair[1], "name", None) or "",
-        ),
-    )
-
-
 def split_shards(
     items: list[T],
     shard_index: int,
@@ -186,7 +145,9 @@ def select_shard_work_units(
     """Select the work units belonging to a shard.
 
     Work units are sorted by their ``id`` (which encodes the feature path)
-    to ensure deterministic, reproducible sharding across machines.
+    to compute the shard assignment deterministically across machines,
+    but the returned list preserves the incoming (e.g. LPT) order so that
+    balancing is not lost.
 
     Args:
         work_units: All work units from the planning phase.
@@ -194,18 +155,20 @@ def select_shard_work_units(
         total_shards: Total number of shards.
 
     Returns:
-        Work units assigned to the requested shard.
+        Work units assigned to the requested shard, in input order.
     """
     sorted_units = sorted(work_units, key=lambda u: u.id)
-    return split_shards(sorted_units, shard_index, total_shards)
+    selected = split_shards(sorted_units, shard_index, total_shards)
+    selected_ids = {id(u) for u in selected}
+    return [u for u in work_units if id(u) in selected_ids]
 
 
 def run_with_shard(config: ShardConfig) -> bool:
     """Run a single shard of the test suite.
 
-    Parses all scenarios, sorts them, selects the shard, and executes it.
-    When ``config.parallel > 1``, scenarios within the shard are distributed
-    among local workers using the existing LPT dispatch.
+    Plans the work units from ``config.features_dir``, selects the shard
+    deterministically, and executes it.  When ``config.parallel > 1``,
+    work units within the shard are distributed among local workers.
 
     Args:
         config: Shard configuration.

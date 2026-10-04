@@ -13,6 +13,22 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _work_unit_feature_path(work_unit_id: str) -> str | None:
+    """Extract the feature file path from a work unit id, if present."""
+    rest = work_unit_id
+    for prefix in ("feature:", "scenario:"):
+        if rest.startswith(prefix):
+            rest = rest[len(prefix) :]
+            break
+    else:
+        return None
+    path = rest.partition("#")[0]
+    marker = ".feature"
+    if marker in path:
+        path = path[: path.index(marker) + len(marker)]
+    return path or None
+
+
 class TimingStore:
     """Load and save historical work unit durations as JSON.
 
@@ -116,6 +132,28 @@ class TimingStore:
             )
             return
         self._data[work_unit_id] = duration
+
+    def prune_stale(self) -> int:
+        """Remove entries whose feature file no longer exists.
+
+        Work unit ids embed the feature path (``feature:<path>``,
+        ``feature:<path>#serial``, ``scenario:<path>:<line>``).  Entries
+        for deleted or renamed feature files are dropped so the timing
+        file does not grow forever.  Entries whose path cannot be
+        extracted are kept.
+
+        Returns:
+            Number of entries removed.
+        """
+        if not self._loaded:
+            self.load()
+        removed = 0
+        for uid in list(self._data):
+            path = _work_unit_feature_path(uid)
+            if path and not Path(path).exists():
+                del self._data[uid]
+                removed += 1
+        return removed
 
     def save_if_changed(self) -> bool:
         """Save data only if it differs from what was loaded.

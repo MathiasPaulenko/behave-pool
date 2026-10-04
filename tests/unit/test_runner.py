@@ -282,6 +282,7 @@ class TestDispatch:
         with (
             patch("behave_pool.runner.WorkerProcess") as mock_wp_cls,
             patch.object(task_queue, "join"),
+            patch.object(runner, "_drain_results", return_value=[]),
         ):
             mock_workers = [MagicMock() for _ in range(3)]
             for mw in mock_workers:
@@ -293,10 +294,11 @@ class TestDispatch:
                 task_queue, result_queue, stop_event, parallel_batch, [], ctx
             )
 
-            assert mock_wp_cls.call_count == 3
-            for w in mock_workers:
+            # Only as many workers as there are work units.
+            assert mock_wp_cls.call_count == 2
+            for w in mock_workers[:2]:
                 w.start.assert_called_once()
-                w.join.assert_called_once_with(timeout=300)
+                w.join.assert_called_once_with(timeout=30.0)
             assert [u.id for u in dispatched] == ["u1", "u2"]
 
     def test_dispatch_serial_only(self, mock_config: MagicMock) -> None:
@@ -323,6 +325,7 @@ class TestDispatch:
         with (
             patch("behave_pool.runner.WorkerProcess") as mock_wp_cls,
             patch.object(task_queue, "join"),
+            patch.object(runner, "_drain_results", return_value=[]),
         ):
             mock_workers = [MagicMock() for _ in range(1)]
             for mw in mock_workers:
@@ -336,7 +339,7 @@ class TestDispatch:
 
             # 0 workers for parallel phase (empty batch) + 1 for serial phase
             assert mock_wp_cls.call_count == 1
-            mock_workers[0].join.assert_called_once_with(timeout=300)
+            mock_workers[0].join.assert_called_once_with(timeout=30.0)
             assert [u.id for u in dispatched] == ["s1", "s2"]
 
     def test_dispatch_mixed(self, mock_config: MagicMock) -> None:
@@ -361,6 +364,7 @@ class TestDispatch:
         with (
             patch("behave_pool.runner.WorkerProcess") as mock_wp_cls,
             patch.object(task_queue, "join"),
+            patch.object(runner, "_drain_results", return_value=[]),
         ):
             mock_workers = [MagicMock() for _ in range(3)]
             for mw in mock_workers:
@@ -377,10 +381,10 @@ class TestDispatch:
                 ctx,
             )
 
-            # 2 workers for parallel + 1 for serial
-            assert mock_wp_cls.call_count == 3
-            for w in mock_workers:
-                w.join.assert_called_once_with(timeout=300)
+            # min(2 workers, 1 unit) for parallel + 1 for serial
+            assert mock_wp_cls.call_count == 2
+            for w in mock_workers[:2]:
+                w.join.assert_called_once_with(timeout=30.0)
             assert [u.id for u in dispatched] == ["u1", "s1"]
 
     def test_dispatch_empty_parallel_skips_workers(self, mock_config: MagicMock) -> None:
@@ -428,6 +432,7 @@ class TestDispatch:
         with (
             patch("behave_pool.runner.WorkerProcess") as mock_wp_cls,
             patch.object(task_queue, "join"),
+            patch.object(runner, "_drain_results", return_value=[]),
         ):
             mock_workers = [MagicMock() for _ in range(2)]
             for mw in mock_workers:
@@ -444,8 +449,8 @@ class TestDispatch:
                 ctx,
             )
 
-            # 2 workers for parallel + 0 for serial (stop_event set)
-            assert mock_wp_cls.call_count == 2
+            # 1 worker for parallel (1 unit) + 0 for serial (stop_event set)
+            assert mock_wp_cls.call_count == 1
             # Serial units not dispatched because stop_event was set
             assert [u.id for u in dispatched] == ["u1"]
 
@@ -472,6 +477,8 @@ class TestDispatch:
         with (
             patch("behave_pool.runner.WorkerProcess") as mock_wp_cls,
             patch.object(task_queue, "join"),
+            patch("behave_pool.runner.RESULT_TIMEOUT", 0.01),
+            patch("behave_pool.runner._POLL_INTERVAL", 0.01),
         ):
             mock_workers = [MagicMock() for _ in range(2)]
             for mw in mock_workers:
@@ -483,9 +490,10 @@ class TestDispatch:
                 task_queue, result_queue, stop_event, parallel_batch, [], ctx
             )
 
-            for w in mock_workers:
-                w.join.assert_called_once_with(timeout=300)
-                w.terminate.assert_called_once()
+            # min(2 workers, 1 unit) = 1 worker spawned
+            assert mock_wp_cls.call_count == 1
+            mock_workers[0].join.assert_called_once_with(timeout=30.0)
+            mock_workers[0].terminate.assert_called_once()
             assert stop_event.is_set()
             assert [u.id for u in dispatched] == ["u1"]
 
@@ -515,6 +523,8 @@ class TestDispatch:
         with (
             patch("behave_pool.runner.WorkerProcess") as mock_wp_cls,
             patch.object(task_queue, "join"),
+            patch("behave_pool.runner.RESULT_TIMEOUT", 0.01),
+            patch("behave_pool.runner._POLL_INTERVAL", 0.01),
         ):
             mock_worker = MagicMock()
             mock_worker.is_alive.return_value = True
@@ -525,7 +535,7 @@ class TestDispatch:
                 task_queue, result_queue, stop_event, [], serial_batch, ctx
             )
 
-            mock_worker.join.assert_called_once_with(timeout=300)
+            mock_worker.join.assert_called_once_with(timeout=30.0)
             mock_worker.terminate.assert_called_once()
             assert stop_event.is_set()
             # Serial units were dispatched even though worker timed out

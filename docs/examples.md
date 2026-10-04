@@ -23,13 +23,12 @@ examples/calculator/
 
 ```ini
 [behave]
-parallel = 4
-parallel-scheme = feature
-parallel-balance = lpt
-parallel-report = behave-pool-report.json
+jobs = 4
+runner = behave_pool:ParallelRunner
 
-[behave.runners]
-parallel = behave_pool:ParallelRunner
+[behave.userdata]
+pool.balance = lpt
+pool.report = behave-pool-report.json
 ```
 
 ### `features/calculator.feature`
@@ -58,13 +57,14 @@ Feature: Calculator
 
 ```bash
 cd examples/calculator
-behave --runner=parallel --parallel 4
+behave-pool --parallel 4
 ```
 
 **What happens:**
 
-1. "Add two numbers" and "Subtract two numbers" run in parallel across workers.
-2. "Shared resource operation" is tagged `@serial`, so it runs after the parallel phase.
+1. The feature is split into two work units: `features/calculator.feature`
+   (the two non-serial scenarios) and `features/calculator.feature#serial`.
+2. "Shared resource operation" runs in the serial phase, after the parallel phase.
 3. `behave-pool-report.json` is written with the full `ExecutionReport` format.
 
 ### Generated JSON report
@@ -81,7 +81,7 @@ The `behave-pool-report.json` file follows the
     "status": "passed",
     "duration": 0.013614,
     "startTime": "2026-07-31T14:36:20.085Z",
-    "endTime": "2026-07-31T14:36:20.085Z"
+    "endTime": "2026-07-31T14:36:20.099Z"
   },
   "statistics": {
     "features": 1,
@@ -203,10 +203,8 @@ my-project/
 
 ```ini
 [behave]
-parallel = 4
-
-[behave.runners]
-parallel = behave_pool:ParallelRunner
+jobs = 4
+runner = behave_pool:ParallelRunner
 ```
 
 ### `features/addition.feature`
@@ -258,33 +256,30 @@ Feature: Multiplication
 ```python
 from behave import given, when, then
 
-_calculator = {}
-_result = None
-
 
 @given("I have a calculator")
 def step_have_calculator(context):
-    _calculator["ready"] = True
+    context.calculator = {"ready": True}
 
 
 @when("I add {a:d} and {b:d}")
 def step_add(context, a, b):
-    _result = a + b
+    context.result = a + b
 
 
 @when("I subtract {b:d} from {a:d}")
 def step_subtract(context, a, b):
-    _result = a - b
+    context.result = a - b
 
 
 @when("I multiply {a:d} by {b:d}")
 def step_multiply(context, a, b):
-    _result = a * b
+    context.result = a * b
 
 
 @then("the result should be {expected:d}")
 def step_result(context, expected):
-    assert _result == expected, f"Expected {expected}, got {_result}"
+    assert context.result == expected, f"Expected {expected}, got {context.result}"
 ```
 
 ### Running
@@ -296,18 +291,11 @@ behave features/
 **Output:**
 
 ```
-Feature: Addition
-  Scenario: Add two positive numbers ... passed
-  Scenario: Add negative numbers ... passed
-
-Feature: Subtraction
-  Scenario: Subtract two numbers ... passed
-  Scenario: Subtract to get negative ... passed
-
-Feature: Multiplication
-  Scenario: Multiply two numbers ... passed
-
-5 scenarios passed, 0 failed, 0 skipped
+USING RUNNER: behave_pool.runner:ParallelRunner
+feature:features/addition.feature ... passed (0.01s)
+feature:features/subtraction.feature ... passed (0.01s)
+feature:features/multiplication.feature ... passed (0.01s)
+3 features, 5 scenarios, 15 steps - passed: 15, failed: 0, skipped: 0, undefined: 0
 ```
 
 **What happened:**
@@ -342,12 +330,12 @@ api-tests/
 
 ```ini
 [behave]
-parallel = 4
-parallel-balance = lpt
-parallel-timing-file = .api-test-timings.json
+jobs = 4
+runner = behave_pool:ParallelRunner
 
-[behave.runners]
-parallel = behave_pool:ParallelRunner
+[behave.userdata]
+pool.balance = lpt
+pool.timing_file = .api-test-timings.json
 ```
 
 ### `features/auth.feature`
@@ -485,7 +473,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: behave --runner=parallel --parallel 4 --shard ${{ matrix.shard }} features/
+      - run: behave-pool --parallel 4 --shard ${{ matrix.shard }} features/
 ```
 
 ### GitLab CI
@@ -496,7 +484,7 @@ test:
   image: python:3.12
   script:
     - pip install behave-pool
-    - behave --runner=parallel --parallel 4 --shard ${CI_NODE_INDEX}/${CI_NODE_TOTAL} features/
+    - behave-pool --parallel 4 --shard ${CI_NODE_INDEX}/${CI_NODE_TOTAL} features/
 ```
 
 ### Jenkins
@@ -508,7 +496,7 @@ pipeline {
         stage('Test') {
             steps {
                 sh 'pip install behave-pool'
-                sh 'behave --runner=parallel --parallel 4 features/'
+                sh 'behave-pool --parallel 4 features/'
             }
         }
     }
@@ -517,30 +505,29 @@ pipeline {
 
 ## Example 4: Custom timing file per environment
 
-```ini
-# behave.ci.ini — for CI
-[behave]
-parallel = 8
-parallel-balance = lpt
-parallel-timing-file = .ci-timings.json
-
-[behave.runners]
-parallel = behave_pool:ParallelRunner
-```
+Behave always reads the same config files (`behave.ini`, `.behaverc`,
+`setup.cfg`, `tox.ini`, `pyproject.toml`) — there is no env var to point it
+at a different file. Override per environment with CLI options or `-D`
+userdata keys instead:
 
 ```ini
-# behave.ini — for local development
+# behave.ini — defaults for local development
 [behave]
-parallel = 2
-parallel-balance = fifo
+jobs = 2
+runner = behave_pool:ParallelRunner
 
-[behave.runners]
-parallel = behave_pool:ParallelRunner
+[behave.userdata]
+pool.balance = fifo
 ```
 
 ```bash
-# CI
-BEHAVE_CONFIG=behave.ci.ini behave features/
+# CI: more workers and a dedicated timing file
+behave-pool --parallel 8 --parallel-balance lpt \
+    --parallel-timing-file .ci-timings.json features/
+
+# or with plain behave
+behave --parallel 8 \
+    -D pool.balance=lpt -D pool.timing_file=.ci-timings.json features/
 
 # Local
 behave features/
@@ -600,13 +587,13 @@ Split the test suite across 3 CI runners, each with 4 local workers:
 
 ```bash
 # Runner 1
-behave --runner=parallel --parallel 4 --shard 1/3 features/
+behave-pool --parallel 4 --shard 1/3 features/
 
 # Runner 2
-behave --runner=parallel --parallel 4 --shard 2/3 features/
+behave-pool --parallel 4 --shard 2/3 features/
 
 # Runner 3
-behave --runner=parallel --parallel 4 --shard 3/3 features/
+behave-pool --parallel 4 --shard 3/3 features/
 ```
 
 ### Python API
@@ -628,11 +615,12 @@ failed = run_with_shard(config)
 Sharding composes with `@serial` tags and `--tags` filtering:
 
 ```bash
-# Tag filtering applies first, then sharding
-behave --runner=parallel --parallel 4 \
+behave-pool --parallel 4 \
     --tags @smoke \
     --shard 1/3 \
     features/
 ```
 
-Serial scenarios within the shard run sequentially after the parallel phase.
+Serial work units within the shard run sequentially after the parallel
+phase. `--tags`/`--name` filters are propagated to workers, so the shard
+assignment stays identical on every machine.

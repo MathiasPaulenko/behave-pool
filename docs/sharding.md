@@ -24,17 +24,31 @@ Each CI runner executes only its assigned shard. Within each shard,
 
 ```bash
 # 3 CI runners, each with 4 local workers
-behave --runner=parallel --parallel 4 --shard 1/3 features/
-behave --runner=parallel --parallel 4 --shard 2/3 features/
-behave --runner=parallel --parallel 4 --shard 3/3 features/
+behave-pool --parallel 4 --shard 1/3 features/
+behave-pool --parallel 4 --shard 2/3 features/
+behave-pool --parallel 4 --shard 3/3 features/
 ```
 
 ### behave.ini
 
+Via `behave-pool` / `python -m behave_pool` (pool options registered
+before config parsing):
+
 ```ini
 [behave]
-parallel = 4
+jobs = 4
 shard = 1/3
+```
+
+Via plain `behave`, use the userdata fallback:
+
+```ini
+[behave]
+jobs = 4
+runner = behave_pool:ParallelRunner
+
+[behave.userdata]
+pool.shard = 1/3
 ```
 
 ### Python API
@@ -54,10 +68,11 @@ failed = run_with_shard(config)
 ## Algorithm
 
 1. **Parse** all features and create work units (same as normal planning).
-2. **Sort** work units deterministically by ID (feature path).
-3. **Split** the sorted list into `TOTAL` contiguous groups. The first
+2. **Assign** work units to shards deterministically: sorted by work unit
+   ID (feature path) and split into `TOTAL` contiguous groups. The first
    `len % TOTAL` shards receive one extra work unit.
-4. **Execute** only the `INDEX`-th group (1-based).
+3. **Execute** only the `INDEX`-th group (1-based), keeping the planned
+   LPT/FIFO order inside the shard.
 
 This ensures:
 
@@ -72,24 +87,24 @@ Sharding composes with all other `behave-pool` features:
 
 | Feature | Behavior with sharding |
 | --- | --- |
-| `--parallel N` | Local parallelism within each shard. Shard filtering happens first, then work units are distributed among N workers. |
-| `@serial` tag | Serial scenarios within the shard run sequentially after the parallel phase. |
-| `--tags` | Tag filtering applies before sharding. Only matching scenarios are split into shards. |
-| `--parallel-balance` | LPT/FIFO ordering applies within the shard. |
+| `--parallel N` | Local parallelism within each shard. Shard filtering happens first, then work units are distributed among up to N workers. |
+| `@serial` tag | Serial work units within the shard run sequentially after the parallel phase. |
+| `--tags` / `--name` | Selection filters are propagated to every worker; non-matching scenarios are skipped inside their work unit. Shard assignment itself is computed over all work units, which keeps it identical on every machine regardless of filters. |
+| `--parallel-balance` | LPT/FIFO ordering is preserved within the shard. |
 | `--parallel-report` | Each shard produces its own report file. |
 
 ### Execution order
 
 ```
-1. Tag filtering (--tags)
+1. Planning + LPT ordering (--parallel-balance)
        ↓
-2. Sharding (--shard INDEX/TOTAL)
+2. Sharding (--shard INDEX/TOTAL, order preserved)
        ↓
 3. Serial/parallel split (@serial)
        ↓
-4. LPT ordering (--parallel-balance)
+4. Local dispatch (--parallel N)
        ↓
-5. Local dispatch (--parallel N)
+5. Tag/name filtering applied inside each worker
 ```
 
 ## Validation
@@ -106,11 +121,10 @@ Invalid shard values raise `ShardError` with a clear message:
 
 ## Output
 
-When sharding is active, the runner logs shard metadata:
+When sharding is active, the runner logs shard metadata at INFO level:
 
 ```
-Shard 1/3 — 4 scenarios selected (of 10 total)
-Running 4 scenarios with 4 workers...
+Shard 1/3 - 4 work units selected (of 10 total)
 ```
 
 ## CI integration example
@@ -127,7 +141,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: pip install behave-pool
-      - run: behave --runner=parallel --parallel 4 --shard ${{ matrix.shard }} features/
+      - run: behave-pool --parallel 4 --shard ${{ matrix.shard }} features/
 ```
 
 ### GitLab CI
@@ -137,5 +151,5 @@ test:
   parallel: 3
   script:
     - pip install behave-pool
-    - behave --runner=parallel --parallel 4 --shard ${CI_NODE_INDEX}/${CI_NODE_TOTAL} features/
+    - behave-pool --parallel 4 --shard ${CI_NODE_INDEX}/${CI_NODE_TOTAL} features/
 ```

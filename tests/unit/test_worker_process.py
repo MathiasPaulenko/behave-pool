@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from behave_pool.config import ConfigSnapshot
 from behave_pool.result import WorkerResult
 from behave_pool.work_unit import WorkUnit
 from behave_pool.worker import WorkerProcess, _worker_run_loop
@@ -29,6 +30,17 @@ def mock_config() -> MagicMock:
 
 def _make_work_unit(unit_id: str, config: MagicMock) -> WorkUnit:
     return WorkUnit(id=unit_id, config=config, feature_path=f"features/{unit_id}.feature")
+
+
+@pytest.fixture
+def snapshot() -> ConfigSnapshot:
+    return ConfigSnapshot(
+        base_dir="features",
+        steps_dir="steps",
+        environment_file="environment.py",
+        lang="en",
+        stop=False,
+    )
 
 
 class TestWorkerProcessLifecycle:
@@ -84,7 +96,9 @@ class TestWorkerProcessLifecycle:
 class TestWorkerRunLoop:
     """Test _worker_run_loop in-process using queue.Queue (no pickling needed)."""
 
-    def test_processes_two_units_and_sentinel(self, mock_config: MagicMock) -> None:
+    def test_processes_two_units_and_sentinel(
+        self, mock_config: MagicMock, snapshot: ConfigSnapshot
+    ) -> None:
         """2 work units + 1 sentinel → 2 WorkerResults, queue empty."""
         task_queue: queue.Queue[Any] = queue.Queue()
         result_queue: queue.Queue[WorkerResult] = queue.Queue()
@@ -106,7 +120,7 @@ class TestWorkerRunLoop:
                 WorkerResult(worker_id=0, work_unit_id=unit2.id, failed=False, duration=0.2),
             ]
 
-            _worker_run_loop(0, task_queue, result_queue, stop_event, mock_config)
+            _worker_run_loop(0, task_queue, result_queue, stop_event, snapshot)
 
             results: list[WorkerResult] = []
             while not result_queue.empty():
@@ -120,7 +134,9 @@ class TestWorkerRunLoop:
             mock_runner.teardown.assert_called_once()
             assert mock_runner.run_work_unit.call_count == 2
 
-    def test_stop_event_skips_remaining_units(self, mock_config: MagicMock) -> None:
+    def test_stop_event_skips_remaining_units(
+        self, mock_config: MagicMock, snapshot: ConfigSnapshot
+    ) -> None:
         """When stop_event is set, remaining units are skipped (loop exits early)."""
         task_queue: queue.Queue[Any] = queue.Queue()
         result_queue: queue.Queue[WorkerResult] = queue.Queue()
@@ -135,7 +151,7 @@ class TestWorkerRunLoop:
             mock_runner = MagicMock()
             mock_runner_cls.return_value = mock_runner
 
-            _worker_run_loop(0, task_queue, result_queue, stop_event, mock_config)
+            _worker_run_loop(0, task_queue, result_queue, stop_event, snapshot)
 
             results: list[WorkerResult] = []
             while not result_queue.empty():
@@ -143,7 +159,7 @@ class TestWorkerRunLoop:
             assert len(results) == 0
             mock_runner.run_work_unit.assert_not_called()
 
-    def test_sentinel_breaks_loop(self, mock_config: MagicMock) -> None:
+    def test_sentinel_breaks_loop(self, mock_config: MagicMock, snapshot: ConfigSnapshot) -> None:
         """Sentinel (None) breaks the loop immediately."""
         task_queue: queue.Queue[Any] = queue.Queue()
         result_queue: queue.Queue[WorkerResult] = queue.Queue()
@@ -155,14 +171,16 @@ class TestWorkerRunLoop:
             mock_runner = MagicMock()
             mock_runner_cls.return_value = mock_runner
 
-            _worker_run_loop(0, task_queue, result_queue, stop_event, mock_config)
+            _worker_run_loop(0, task_queue, result_queue, stop_event, snapshot)
 
             mock_runner.run_work_unit.assert_not_called()
             mock_runner.setup.assert_called_once()
             mock_runner.teardown.assert_called_once()
             assert task_queue.empty()
 
-    def test_teardown_called_on_exception(self, mock_config: MagicMock) -> None:
+    def test_teardown_called_on_exception(
+        self, mock_config: MagicMock, snapshot: ConfigSnapshot
+    ) -> None:
         """teardown is called even if setup raises, and an error result is queued."""
         task_queue: queue.Queue[Any] = queue.Queue()
         result_queue: queue.Queue[WorkerResult] = queue.Queue()
@@ -175,7 +193,7 @@ class TestWorkerRunLoop:
             mock_runner_cls.return_value = mock_runner
             mock_runner.setup.side_effect = RuntimeError("setup crash")
 
-            _worker_run_loop(0, task_queue, result_queue, stop_event, mock_config)
+            _worker_run_loop(0, task_queue, result_queue, stop_event, snapshot)
 
             mock_runner.teardown.assert_called_once()
             assert stop_event.is_set()
@@ -184,7 +202,9 @@ class TestWorkerRunLoop:
             assert "setup crash" in (result.error or "")
             assert result.work_unit_id == "setup"
 
-    def test_worker_loop_exits_on_eoferror(self, mock_config: MagicMock) -> None:
+    def test_worker_loop_exits_on_eoferror(
+        self, mock_config: MagicMock, snapshot: ConfigSnapshot
+    ) -> None:
         """Worker loop should exit gracefully when queue raises EOFError."""
         task_queue: queue.Queue[Any] = queue.Queue()
         result_queue: queue.Queue[WorkerResult] = queue.Queue()
@@ -195,12 +215,14 @@ class TestWorkerRunLoop:
             mock_runner_cls.return_value = mock_runner
 
             with patch.object(task_queue, "get", side_effect=EOFError):
-                _worker_run_loop(0, task_queue, result_queue, stop_event, mock_config)
+                _worker_run_loop(0, task_queue, result_queue, stop_event, snapshot)
 
             mock_runner.run_work_unit.assert_not_called()
             mock_runner.teardown.assert_called_once()
 
-    def test_worker_loop_stops_after_abort(self, mock_config: MagicMock) -> None:
+    def test_worker_loop_stops_after_abort(
+        self, mock_config: MagicMock, snapshot: ConfigSnapshot
+    ) -> None:
         """When runner.aborted becomes True after a work unit, the loop should break.
 
         Regression test: previously, an aborted worker would continue processing
@@ -224,7 +246,7 @@ class TestWorkerRunLoop:
             ]
             mock_runner.aborted = True
 
-            _worker_run_loop(0, task_queue, result_queue, stop_event, mock_config)
+            _worker_run_loop(0, task_queue, result_queue, stop_event, snapshot)
 
             results: list[WorkerResult] = []
             while not result_queue.empty():
@@ -234,7 +256,9 @@ class TestWorkerRunLoop:
             assert mock_runner.run_work_unit.call_count == 1
             mock_runner.teardown.assert_called_once()
 
-    def test_worker_loop_sets_stop_event_on_abort(self, mock_config: MagicMock) -> None:
+    def test_worker_loop_sets_stop_event_on_abort(
+        self, mock_config: MagicMock, snapshot: ConfigSnapshot
+    ) -> None:
         """When runner.aborted becomes True, stop_event must be set so other
         workers stop cooperatively and the coordinator skips the serial phase.
 
@@ -258,7 +282,7 @@ class TestWorkerRunLoop:
             ]
             mock_runner.aborted = True
 
-            _worker_run_loop(0, task_queue, result_queue, stop_event, mock_config)
+            _worker_run_loop(0, task_queue, result_queue, stop_event, snapshot)
 
             assert stop_event.is_set()
 

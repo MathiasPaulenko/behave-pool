@@ -32,18 +32,34 @@ pip install behave-pool
 
 ## Quick start
 
-1. Register the runner in your `behave.ini`:
+```bash
+behave-pool --parallel 4 features/
+```
 
-   ```ini
-   [behave.runners]
-   parallel = behave_pool:ParallelRunner
-   ```
+`behave-pool` is a drop-in behave wrapper: it registers the extra
+`--parallel-*`/`--shard` options before behave parses the command line
+and uses `ParallelRunner` automatically (unless `--runner` selects a
+different one). `python -m behave_pool` is equivalent.
 
-2. Run Behave with parallel workers:
+Prefer the plain `behave` command? Register the runner alias and set
+`jobs` in `behave.ini`:
 
-   ```bash
-   behave --runner=parallel --parallel 4 --parallel-scheme feature features/
-   ```
+```ini
+[behave]
+jobs = 4
+runner = behave_pool:ParallelRunner
+```
+
+or map an alias and select it on the command line:
+
+```ini
+[behave.runners]
+parallel = behave_pool:ParallelRunner
+```
+
+```bash
+behave --runner=parallel --parallel 4 features/
+```
 
 ## How it works
 
@@ -52,10 +68,10 @@ pip install behave-pool
 │                  ParallelRunner                  │
 │                                                  │
 │  1. Plan    — parse features, create work units  │
-│  2. Split   — separate @serial from parallel     │
-│  3. Dispatch — N workers consume from queue      │
-│  4. Collect — gather results, update timings     │
-│  5. Serial  — run @serial units one at a time    │
+│  2. Shard   — select shard slice (if --shard)    │
+│  3. Split   — separate @serial from parallel     │
+│  4. Dispatch — N parallel workers, then 1 serial │
+│  5. Collect — gather results, update timings     │
 └─────────────────────────────────────────────────┘
          │                          │
     ┌────▼────┐               ┌────▼────┐
@@ -80,7 +96,7 @@ results, persists timings, and returns the aggregated exit code.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--parallel N` | `1` | Number of worker processes. `1` = sequential passthrough. |
-| `--parallel-scheme` | `feature` | Parallelization unit: `feature` (scenario planned for future). |
+| `--parallel-scheme` | `feature` | Parallelization unit: `feature` or `scenario`. A `scenario` unit maps to one Scenario or one whole ScenarioOutline. |
 | `--parallel-balance` | `lpt` | Work ordering: `lpt` (longest first) or `fifo` (insertion order). |
 | `--parallel-timing-file` | `.behave-pool-timing.json` | Path to timing file for LPT balancing. |
 | `--parallel-report` | `behave-pool-report.json` | Path to unified JSON report (behave-modern-json-report format). |
@@ -94,7 +110,14 @@ Each feature file runs in its own worker process. Workers are dispatched dynamic
 
 ```bash
 # 4 worker processes, LPT balancing
-behave --runner=parallel --parallel 4 features/
+behave-pool --parallel 4 features/
+```
+
+For finer granularity, `--parallel-scheme scenario` creates one work unit
+per scenario (a whole ScenarioOutline counts as a single unit):
+
+```bash
+behave-pool --parallel 4 --parallel-scheme scenario features/
 ```
 
 ### Serial scenarios
@@ -115,7 +138,7 @@ By default, `behave-pool` uses Longest Processing Time (LPT) scheduling. It stor
 
 ```bash
 # Use FIFO ordering instead of LPT
-behave --runner=parallel --parallel 4 --parallel-balance fifo features/
+behave-pool --parallel 4 --parallel-balance fifo features/
 ```
 
 ### Unified JSON report
@@ -131,11 +154,11 @@ JSON report in the [`behave-modern-json-report`](https://github.com/MathiasPaule
 
 ```bash
 # Default report path
-behave --runner=parallel --parallel 4 features/
+behave-pool --parallel 4 features/
 # → writes behave-pool-report.json
 
 # Custom report path
-behave --runner=parallel --parallel 4 \
+behave-pool --parallel 4 \
     --parallel-report reports/run.json \
     features/
 ```
@@ -151,29 +174,30 @@ only its assigned shard:
 
 ```bash
 # Runner 1 of 3
-behave --runner=parallel --parallel 4 --shard 1/3 features/
+behave-pool --parallel 4 --shard 1/3 features/
 
 # Runner 2 of 3
-behave --runner=parallel --parallel 4 --shard 2/3 features/
+behave-pool --parallel 4 --shard 2/3 features/
 
 # Runner 3 of 3
-behave --runner=parallel --parallel 4 --shard 3/3 features/
+behave-pool --parallel 4 --shard 3/3 features/
 ```
 
 Sharding composes with all other features:
 
 - **`--parallel`**: local parallelism within each shard.
 - **`@serial`**: serial scenarios run sequentially within the shard.
-- **`--tags`**: tag filtering applies before sharding.
+- **`--tags`/`--name`**: selection filters are propagated to every worker.
+- **`--parallel-balance`**: LPT/FIFO ordering is preserved inside the shard.
 
-The algorithm sorts work units deterministically by ID, then splits
-them into `TOTAL` contiguous groups. The first `len % TOTAL` shards
-receive one extra work unit.
+The algorithm sorts work units deterministically by ID to compute the
+shard assignment, then executes them in the planned (LPT/FIFO) order.
+The first `len % TOTAL` shards receive one extra work unit.
 
-Output includes shard metadata:
+Output includes shard metadata (logged at INFO level):
 
 ```
-Shard 1/3 — 4 scenarios selected (of 10 total)
+Shard 1/3 - 4 work units selected (of 10 total)
 ```
 
 Python API:
@@ -192,16 +216,42 @@ failed = run_with_shard(config)
 
 ### behave.ini configuration
 
-All CLI options can also be set in `behave.ini`:
+Config-file keys must use the option's `dest` name (underscores, not
+dashes) — behave reads them verbatim. `--parallel` maps to `jobs`:
 
 ```ini
 [behave]
-parallel = 4
-parallel-scheme = feature
-parallel-balance = lpt
-parallel-timing-file = .behave-pool-timing.json
-parallel-report = behave-pool-report.json
+jobs = 4
+parallel_scheme = feature
+parallel_balance = lpt
+parallel_timing_file = .behave-pool-timing.json
+parallel_report = behave-pool-report.json
 shard = 1/3
+```
+
+The pool keys (`parallel_*`, `shard`) are only picked up when the
+options were registered before behave parses the file — i.e. when using
+`behave-pool` / `python -m behave_pool`. With the plain `behave`
+command, use `[behave.userdata]` entries instead; they are applied when
+the runner initialises:
+
+```ini
+[behave]
+jobs = 4
+runner = behave_pool:ParallelRunner
+
+[behave.userdata]
+pool.scheme = feature
+pool.balance = fifo
+pool.timing_file = .behave-pool-timing.json
+pool.report = behave-pool-report.json
+pool.shard = 1/3
+```
+
+The same `pool.*` keys work on the command line via `-D`:
+
+```bash
+behave --runner=behave_pool:ParallelRunner -D pool.jobs=4 -D pool.shard=1/3
 ```
 
 ## Requirements
@@ -216,7 +266,7 @@ It demonstrates parallel execution, `@serial` scenarios, and the unified JSON re
 
 ```bash
 cd examples/calculator
-behave --runner=parallel --parallel 4
+behave-pool --parallel 4
 # → runs 3 scenarios (2 parallel + 1 @serial)
 # → writes behave-pool-report.json with ExecutionReport format
 ```

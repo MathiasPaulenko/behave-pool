@@ -27,6 +27,9 @@ pip install behave-priority
 Register both in `behave.ini`:
 
 ```ini
+[behave]
+jobs = 4
+
 [behave.runners]
 parallel = behave_pool:ParallelRunner
 priority = behave_priority:PriorityRunner
@@ -82,28 +85,31 @@ pip install behave-modern-json-report
 
 ### Usage with behave-pool
 
-Register the formatter in `behave.ini`:
+Behave formatters (`--format`/`--outfile`) are not wired into the
+parallel workers, so use the built-in unified report instead — it
+implements the same `ExecutionReport` schema that
+`behave-modern-json-report` produces:
+
+```bash
+behave-pool --parallel 4 --parallel-report report.json features/
+```
 
 ```ini
 [behave]
-format = modern-json
+jobs = 4
+runner = behave_pool:ParallelRunner
 
-[behave.formatters]
-modern-json = behave_modern_json_report:ModernJSONFormatter
-
-[behave.runners]
-parallel = behave_pool:ParallelRunner
+[behave.userdata]
+pool.report = report.json
 ```
 
-Run with JSON output:
-
-```bash
-behave --runner=parallel --parallel 4 --format=modern-json --outfile=report.json features/
-```
+Any tool that consumes the modern JSON `ExecutionReport` format can read
+this file directly — features, scenarios, steps, errors, durations and
+tag statistics included.
 
 ### Output format
 
-The modern JSON report includes:
+The unified report includes:
 
 - Feature, scenario, and step-level results
 - Durations for each level
@@ -146,33 +152,31 @@ pip install "behave-pool[ecosystem]"
 
 ```ini
 [behave]
-parallel = 4
-parallel-balance = lpt
-format = modern-json
+jobs = 4
+runner = behave_pool:ParallelRunner
 
-[behave.runners]
-parallel = behave_pool:ParallelRunner
-
-[behave.formatters]
-modern-json = behave_modern_json_report:ModernJSONFormatter
+[behave.userdata]
+pool.balance = lpt
+pool.report = report.json
 ```
 
 ```bash
-behave --format=modern-json --outfile=report.json features/
+behave-pool features/
 ```
 
 This gives you:
 
 - **Parallel execution** with 4 worker processes
 - **LPT load balancing** for optimal wall-clock time
-- **Modern JSON output** for CI integration and reporting
+- **Unified JSON report** (modern-json compatible schema) for CI
+  integration and reporting
 
 ## Compatibility
 
 | Package | Status | Notes |
 | --- | --- | --- |
 | `behave-priority` | Compatible | Works as a wrapping runner |
-| `behave-modern-json-report` | Compatible | Works as a formatter |
+| `behave-modern-json-report` | Schema-compatible | Formatters don't run inside workers; `--parallel-report` emits the same `ExecutionReport` schema |
 | `behave` | Required (`>=1.3.0`) | Base framework |
 | `pytest` | Compatible | For running `behave-pool`'s own test suite |
 

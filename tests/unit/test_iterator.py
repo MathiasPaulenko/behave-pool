@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from behave.model import Feature, Scenario
 
-from behave_pool.iterator import FeatureIterator, WorkUnitIterator
+from behave_pool.iterator import FeatureIterator, ScenarioIterator, WorkUnitIterator
 
 
 def _make_feature(
@@ -154,8 +154,91 @@ class TestForScheme:
         with pytest.raises(ValueError, match="Unknown parallel scheme"):
             WorkUnitIterator.for_scheme("invalid", sample_features, mock_config)
 
-    def test_scenario_scheme_raises_not_implemented(
+    def test_scenario_scheme_returns_scenario_iterator(
         self, sample_features: list[Feature], mock_config: MagicMock
     ) -> None:
-        with pytest.raises(NotImplementedError, match="not yet implemented"):
-            WorkUnitIterator.for_scheme("scenario", sample_features, mock_config)
+        iterator = WorkUnitIterator.for_scheme("scenario", sample_features, mock_config)
+        assert isinstance(iterator, ScenarioIterator)
+
+
+class TestSerialSplit:
+    """A feature mixing @serial and non-serial scenarios splits in two units."""
+
+    def _mixed_features(self):
+        from pathlib import Path
+
+        from behave.runner import parse_features
+
+        fixture = (
+            Path(__file__).parent.parent / "fixtures" / "serial" / "features" / "mixed.feature"
+        )
+        return parse_features([str(fixture)])
+
+    def test_mixed_feature_splits(self, mock_config: MagicMock) -> None:
+        features = self._mixed_features()
+        units = list(FeatureIterator(features, mock_config).iterate())
+        assert len(units) == 2
+        parallel, serial = units
+        assert parallel.id.endswith("mixed.feature")
+        assert parallel.serial_mode == "exclude"
+        assert "serial" not in parallel.tags
+        assert serial.id == f"{parallel.id}#serial"
+        assert serial.serial_mode == "only"
+        assert "serial" in serial.tags
+        assert serial.is_serial
+
+    def test_serial_only_feature_single_unit(self, mock_config: MagicMock) -> None:
+        features = self._mixed_features()
+        for f in features:
+            f.tags = ["serial"]
+        units = list(FeatureIterator(features, mock_config).iterate())
+        assert len(units) == 1
+        assert units[0].serial_mode == "all"
+        assert units[0].is_serial
+
+
+class TestScenarioIterator:
+    """Scenario-level scheme: one work unit per scenario run item."""
+
+    def _parse(self, *names: str):
+        from pathlib import Path
+
+        from behave.runner import parse_features
+
+        base = Path(__file__).parent.parent / "fixtures"
+        paths = []
+        for name in names:
+            paths.extend(str(p) for p in base.rglob(name))
+        return parse_features(paths)
+
+    def test_one_unit_per_scenario(self, mock_config: MagicMock) -> None:
+        features = self._parse("mixed.feature")
+        units = list(ScenarioIterator(features, mock_config).iterate())
+        # mixed.feature has 4 scenarios: 2 parallel + 2 @serial
+        assert len(units) == 4
+        assert all(u.scenario_line is not None for u in units)
+        assert all(u.id.startswith("scenario:") for u in units)
+        assert len({u.id for u in units}) == 4
+
+    def test_serial_scenarios_become_serial_units(self, mock_config: MagicMock) -> None:
+        features = self._parse("mixed.feature")
+        units = list(ScenarioIterator(features, mock_config).iterate())
+        serial_units = [u for u in units if u.is_serial]
+        parallel_units = [u for u in units if not u.is_serial]
+        assert len(serial_units) == 2
+        assert len(parallel_units) == 2
+
+    def test_serial_feature_makes_all_units_serial(self, mock_config: MagicMock) -> None:
+        features = self._parse("mixed.feature")
+        for f in features:
+            f.tags = ["serial"]
+            # effective_tags must reflect the change for children
+        units = list(ScenarioIterator(features, mock_config).iterate())
+        assert len(units) == 4
+        assert all(u.is_serial for u in units)
+
+    def test_simple_features_all_parallel(self, mock_config: MagicMock) -> None:
+        features = self._parse("checkout.feature", "login.feature")
+        units = list(ScenarioIterator(features, mock_config).iterate())
+        assert len(units) == 4  # 2 scenarios each
+        assert all(not u.is_serial for u in units)

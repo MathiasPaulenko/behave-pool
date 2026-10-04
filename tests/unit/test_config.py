@@ -382,3 +382,51 @@ class TestSnapshotConfigPathFields:
 
         snap = snapshot_config(config)
         assert snap.parallel == 1
+
+
+class TestUserdataFallback:
+    """pool.* userdata keys provide options when using plain behave."""
+
+    def _bare_config(self, userdata: dict | None = None) -> MagicMock:
+        config = MagicMock()
+        config.jobs = 1
+        config.shard = None
+        config.userdata = userdata or {}
+        for attr in (
+            "parallel_scheme",
+            "parallel_balance",
+            "parallel_timing_file",
+            "parallel_report",
+            "shard_index",
+            "total_shards",
+            "use_nested_step_modules",
+        ):
+            delattr(config, attr)
+        return config
+
+    def test_userdata_balance_applied(self) -> None:
+        config = self._bare_config({"pool.balance": "fifo"})
+        add_parallel_options(config)
+        assert config.parallel_balance == "fifo"
+
+    def test_userdata_jobs_applied(self) -> None:
+        config = self._bare_config({"pool.jobs": "4"})
+        add_parallel_options(config)
+        assert config.parallel == 4
+
+    def test_userdata_shard_applied(self) -> None:
+        config = self._bare_config({"pool.shard": "2/3"})
+        add_parallel_options(config)
+        assert config.shard_index == 2
+        assert config.total_shards == 3
+
+    def test_explicit_nondefault_wins_over_userdata(self) -> None:
+        config = self._bare_config({"pool.balance": "lpt"})
+        config.parallel_balance = "fifo"
+        add_parallel_options(config)
+        assert config.parallel_balance == "fifo"
+
+    def test_non_string_userdata_ignored(self) -> None:
+        config = self._bare_config({"pool.balance": MagicMock()})
+        add_parallel_options(config)
+        assert config.parallel_balance == "lpt"

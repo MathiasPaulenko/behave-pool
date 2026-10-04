@@ -6,6 +6,7 @@ import contextlib
 import logging
 import multiprocessing
 import queue
+import re
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_SENSITIVE_KEY_RE = re.compile(r"(password|passwd|secret|token|apikey|api_key|credential)", re.I)
+
+
+def _sanitize_url(url: str) -> str:
+    """Remove credentials embedded in a URL (``scheme://user:pass@host``)."""
+    if "://" not in url or "@" not in url:
+        return url
+    scheme, _, rest = url.partition("://")
+    authority, _, path = rest.partition("/")
+    if "@" not in authority:
+        return url
+    host = authority.rsplit("@", 1)[1]
+    return f"{scheme}://{host}/{path}"
+
+
+def _sanitize_command(cmd: str) -> str:
+    """Mask ``-D key=value`` values whose key looks like a credential."""
+    import re as _re
+
+    def _mask(match: _re.Match[str]) -> str:
+        key = match.group(2)
+        if _SENSITIVE_KEY_RE.search(key):
+            return f"{match.group(1)}{key}=***"
+        return match.group(0)
+
+    return _re.sub(r"(-D\s+|--define\s+)([^\s=]+)=\S+", _mask, cmd)
+
+
+# Per-work-unit timeout in seconds.  If no result arrives for a pending
+# work unit within this window, the involved workers are terminated and
+# the remaining units count as failed (missing results).
+RESULT_TIMEOUT = 300.0
+
+# Grace period for workers to exit on their own (sentinel consumed)
+# before they are terminated forcibly.
+WORKER_SHUTDOWN_TIMEOUT = 30.0
+
+# How often _await_results wakes up to check worker liveness/stop event.
+_POLL_INTERVAL = 2.0
+
+
 class ParallelRunner(Runner):  # type: ignore[misc]
     """Coordinator that dispatches work units to worker processes.
 
@@ -38,6 +80,10 @@ class ParallelRunner(Runner):  # type: ignore[misc]
     def __init__(self, config: Configuration) -> None:
         super().__init__(config)
         add_parallel_options(config)
+        self._early_results: list[WorkerResult] = []
+        self._exec_started_at: Any = None
+        self._exec_ended_at: Any = None
+        self._exec_wall_duration: float | None = None
 
     def run(self) -> bool:
         """Run the test suite — parallel or sequential depending on config."""
@@ -82,11 +128,16 @@ class ParallelRunner(Runner):  # type: ignore[misc]
 
     def _run_parallel(self) -> bool:
         """Execute the parallel pipeline: plan -> shard -> split -> dispatch -> collect."""
+        from datetime import UTC, datetime
+
         ctx = multiprocessing.get_context("spawn")
         task_queue: Any = ctx.JoinableQueue()
         result_queue: Any = ctx.Queue()
         stop_event: Any = ctx.Event()
 
+        self._exec_started_at = datetime.now(UTC)
+        started = time.monotonic()
+        self._early_results = []
         try:
             work_units = self._plan()
             if self._is_sharding_active():
@@ -97,6 +148,8 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             )
             return self._collect(result_queue, dispatched)
         finally:
+            self._exec_ended_at = datetime.now(UTC)
+            self._exec_wall_duration = time.monotonic() - started
             stop_event.set()
             task_queue.close()
             result_queue.close()
@@ -137,8 +190,8 @@ class ParallelRunner(Runner):  # type: ignore[misc]
     def _apply_shard(self, work_units: list[WorkUnit]) -> list[WorkUnit]:
         """Filter work units to only those in the current shard.
 
-        Work units are sorted by ``id`` for deterministic splitting, then
-        the shard slice is selected and the shard metadata is logged.
+        Shard membership is computed on ids sorted deterministically, but
+        the returned list preserves the planned (LPT/FIFO) order.
 
         Args:
             work_units: All planned work units.
@@ -180,7 +233,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             return
         if total is not None:
             logger.info(
-                "Shard %d/%d — %d scenarios selected (of %d total)",
+                "Shard %d/%d - %d work units selected (of %d total)",
                 shard_index,
                 total_shards,
                 selected_count,
@@ -188,7 +241,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             )
         else:
             logger.info(
-                "Shard %d/%d — %d features selected",
+                "Shard %d/%d - %d features selected",
                 shard_index,
                 total_shards,
                 selected_count,
@@ -248,18 +301,23 @@ class ParallelRunner(Runner):  # type: ignore[misc]
     ) -> list[WorkUnit]:
         """Two-phase dispatch: parallel first, then serial.
 
-        Phase 1: enqueue parallel_batch, launch N workers, wait for completion.
-        Phase 2: enqueue serial_batch one at a time, launch 1 worker, wait.
+        Phase 1: enqueue parallel_batch, launch up to N workers (never more
+        than there are work units), collect each result as it arrives.
+        Phase 2: enqueue serial_batch, launch 1 worker, collect results.
+
+        Results are collected while dispatching so that the per-unit
+        timeout (:data:`RESULT_TIMEOUT`) applies to each work unit rather
+        than to a whole phase.
 
         Returns:
             List of work units that were actually enqueued (dispatched).
         """
-        n_workers = self.config.parallel
         config_snapshot = snapshot_config(self.config)
         dispatched: list[WorkUnit] = []
 
         # -- Phase 1: parallel batch with N workers.
         if parallel_batch:
+            n_workers = min(self.config.parallel, len(parallel_batch))
             for unit in parallel_batch:
                 task_queue.put(unit)
             for _ in range(n_workers):
@@ -279,24 +337,11 @@ class ParallelRunner(Runner):  # type: ignore[misc]
                 worker.start()
                 workers.append(worker)
 
-            for worker in workers:
-                worker.join(timeout=300)
-                if worker.is_alive():
-                    logger.warning(
-                        "Worker %d did not terminate within 300s; "
-                        "setting stop event and terminating.",
-                        worker.worker_id,
-                    )
-                    stop_event.set()
-                    worker.terminate()
-
-            # Drain any unconsumed items so the queue is empty for Phase 2.
-            while not task_queue.empty():
-                try:
-                    task_queue.get_nowait()
-                    task_queue.task_done()
-                except queue.Empty:
-                    break
+            self._early_results.extend(
+                self._await_results(result_queue, stop_event, parallel_batch, workers)
+            )
+            self._shutdown_workers(workers, stop_event)
+            self._drain_queue(task_queue)
 
         # -- Phase 2: serial batch with 1 worker.
         if serial_batch and not stop_event.is_set():
@@ -314,24 +359,107 @@ class ParallelRunner(Runner):  # type: ignore[misc]
                 ctx=ctx,
             )
             serial_worker.start()
-            serial_worker.join(timeout=300)
-            if serial_worker.is_alive():
-                logger.warning(
-                    "Serial worker did not terminate within 300s; "
-                    "setting stop event and terminating."
-                )
-                stop_event.set()
-                serial_worker.terminate()
 
-            # Drain any unconsumed items.
-            while not task_queue.empty():
-                try:
-                    task_queue.get_nowait()
-                    task_queue.task_done()
-                except queue.Empty:
-                    break
+            self._early_results.extend(
+                self._await_results(result_queue, stop_event, serial_batch, [serial_worker])
+            )
+            self._shutdown_workers([serial_worker], stop_event)
+            self._drain_queue(task_queue)
 
         return dispatched
+
+    def _await_results(
+        self,
+        result_queue: Any,
+        stop_event: Any,
+        units: list[WorkUnit],
+        workers: list[WorkerProcess],
+    ) -> list[WorkerResult]:
+        """Collect results for ``units`` while the workers are running.
+
+        Each work unit may take up to :data:`RESULT_TIMEOUT` seconds; the
+        clock restarts with every received result.  When a unit times out,
+        the workers are terminated and the pending units count as missing.
+        If ``config.stop`` is set, the first failure sets ``stop_event`` so
+        workers drop all queued units.
+        """
+        pending = {u.id for u in units}
+        results: list[WorkerResult] = []
+        last_result_at = time.monotonic()
+        while pending:
+            try:
+                result = result_queue.get(timeout=_POLL_INTERVAL)
+            except queue.Empty:
+                result = None
+            except (EOFError, OSError):
+                break
+            if result is not None:
+                results.append(result)
+                pending.discard(result.work_unit_id)
+                last_result_at = time.monotonic()
+                self._print_progress(result)
+                if result.failed and self.config.stop:
+                    stop_event.set()
+            if not pending:
+                break
+            if time.monotonic() - last_result_at >= RESULT_TIMEOUT:
+                logger.warning(
+                    "No worker result within %ds; terminating worker(s).",
+                    int(RESULT_TIMEOUT),
+                )
+                stop_event.set()
+                break
+            if all(not w.is_alive() for w in workers):
+                # All workers exited/crashed — drain anything still in flight.
+                results.extend(self._drain_results(result_queue, pending))
+                break
+        return results
+
+    def _drain_results(self, result_queue: Any, pending: set[str]) -> list[WorkerResult]:
+        """Drain already-produced results after workers exited."""
+        results: list[WorkerResult] = []
+        deadline = time.monotonic() + 5.0
+        while pending and time.monotonic() < deadline:
+            try:
+                result = result_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except (EOFError, OSError):
+                break
+            results.append(result)
+            pending.discard(result.work_unit_id)
+            self._print_progress(result)
+        return results
+
+    def _shutdown_workers(self, workers: list[WorkerProcess], stop_event: Any) -> None:
+        """Wait briefly for workers to exit, then terminate stragglers."""
+        for worker in workers:
+            worker.join(timeout=WORKER_SHUTDOWN_TIMEOUT)
+            if worker.is_alive():
+                logger.warning(
+                    "Worker %d did not terminate; setting stop event and terminating.",
+                    worker.worker_id,
+                )
+                stop_event.set()
+                worker.terminate()
+
+    @staticmethod
+    def _drain_queue(task_queue: Any) -> None:
+        """Drain any unconsumed items so the queue is empty for the next phase."""
+        while not task_queue.empty():
+            try:
+                task_queue.get_nowait()
+                task_queue.task_done()
+            except queue.Empty:
+                break
+
+    @staticmethod
+    def _print_progress(result: WorkerResult) -> None:
+        """Print one line per finished work unit (replaces formatter output)."""
+        status = "FAILED" if result.failed else "passed"
+        if result.error:
+            status = f"ERROR ({result.error})"
+        print(f"{result.work_unit_id} ... {status} ({result.duration:.2f}s)")
 
     def _collect(
         self,
@@ -345,8 +473,8 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             True if any test failed (Behave convention).
         """
         expected = len(work_units)
-        results: list[WorkerResult] = []
-        received_ids: set[str] = set()
+        results: list[WorkerResult] = list(self._early_results)
+        received_ids: set[str] = {r.work_unit_id for r in results}
 
         # Drain all available results, waiting up to deadline_seconds for late arrivals.
         deadline = time.monotonic() + deadline_seconds
@@ -357,6 +485,8 @@ class ParallelRunner(Runner):  # type: ignore[misc]
                 continue
             except (EOFError, OSError):
                 break
+            if result.work_unit_id in received_ids:
+                continue
             results.append(result)
             received_ids.add(result.work_unit_id)
 
@@ -375,9 +505,24 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         if missing:
             any_failed = True
 
-        self._update_timings(results)
+        # Propagate undefined steps so --show-snippets works in parallel.
+        seen_undefined: set[str] = set()
+        for r in results:
+            for step_text in r.undefined_steps:
+                if step_text not in seen_undefined:
+                    seen_undefined.add(step_text)
+                    self.undefined_steps.append(step_text)
 
-        self._merge_reports(results)
+        self._update_timings(results, work_units)
+
+        statistics = self._merge_reports(results)
+        if statistics is not None:
+            print(
+                f"{statistics['features']} features, {statistics['scenarios']} scenarios, "
+                f"{statistics['steps']} steps - "
+                f"passed: {statistics['passed']}, failed: {statistics['failed']}, "
+                f"skipped: {statistics['skipped']}, undefined: {statistics['undefined']}"
+            )
 
         logger.info(
             "Parallel run complete: %d work units, %d results, failed=%s",
@@ -388,14 +533,21 @@ class ParallelRunner(Runner):  # type: ignore[misc]
 
         return any_failed
 
-    def _update_timings(self, results: list[WorkerResult]) -> None:
+    def _update_timings(
+        self, results: list[WorkerResult], work_units: list[WorkUnit] | None = None
+    ) -> None:
         """Update the TimingStore with observed durations from results.
+
+        Entries whose feature file no longer exists are pruned so that
+        renamed or deleted features do not accumulate forever.
 
         Timing persistence is best-effort: any failure is logged and
         does not affect the test run outcome.
 
         Args:
             results: Worker results containing durations to persist.
+            work_units: Dispatched work units (unused; kept for
+                backward compatibility of the method signature).
         """
         timing_file = (
             getattr(self.config, "parallel_timing_file", None) or ".behave-pool-timing.json"
@@ -405,13 +557,14 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             store.load()
             for result in results:
                 store.update(result.work_unit_id, result.duration)
+            store.prune_stale()
             store.save_if_changed()
         except Exception:
             logger.warning(
                 "Failed to update timing file %s; timings will not persist.", timing_file
             )
 
-    def _merge_reports(self, results: list[WorkerResult]) -> None:
+    def _merge_reports(self, results: list[WorkerResult]) -> dict[str, Any] | None:
         """Merge per-worker JSON reports into a unified Behave-compatible JSON.
 
         Reads each worker's report file (pointed to by WorkerResult.report_path),
@@ -423,6 +576,9 @@ class ParallelRunner(Runner):  # type: ignore[misc]
 
         Args:
             results: Worker results with report paths to merge.
+
+        Returns:
+            The computed statistics dict, or None if writing failed.
         """
         import json
 
@@ -439,7 +595,12 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             except Exception:
                 logger.warning("Failed to read worker report %s; skipping.", result.report_path)
 
-        statistics = self._compute_statistics(all_features)
+        # Same file may appear in several work units (scenario scheme or a
+        # mixed feature split into parallel/serial halves) — merge those
+        # partial entries into a single feature dict.
+        all_features = self._merge_feature_dicts(all_features)
+
+        statistics: dict[str, Any] | None = self._compute_statistics(all_features)
         environment = self._detect_environment()
         execution = self._build_execution(results)
 
@@ -463,6 +624,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             logger.info("Unified report written to %s", report_path)
         except Exception:
             logger.warning("Failed to write unified report to %s", report_path)
+            statistics = None
 
         tmp_dir = Path("tmp")
         if tmp_dir.is_dir():
@@ -472,6 +634,53 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             if not any(tmp_dir.iterdir()):
                 with contextlib.suppress(OSError):
                     tmp_dir.rmdir()
+
+        return statistics
+
+    @staticmethod
+    def _merge_feature_dicts(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge partial feature dicts that share the same ``filename``.
+
+        Work units that split a feature (``#serial`` halves or per-scenario
+        units under ``--parallel-scheme scenario``) produce one report entry
+        each; they are combined so every file appears once, with all its
+        scenarios, summed duration, and the worst scenario status.
+        """
+        severity = {
+            "untested": 0,
+            "skipped": 1,
+            "passed": 2,
+            "pending": 3,
+            "undefined": 3,
+            "failed": 4,
+            "error": 4,
+            "hook_error": 4,
+            "cleanup_error": 4,
+        }
+        merged: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for feature in features:
+            key = str(feature.get("filename") or feature.get("id") or id(feature))
+            if key not in merged:
+                entry = dict(feature)
+                entry["scenarios"] = list(feature.get("scenarios") or [])
+                merged[key] = entry
+                order.append(key)
+                continue
+            entry = merged[key]
+            entry["scenarios"].extend(feature.get("scenarios") or [])
+            entry["duration"] = (entry.get("duration") or 0.0) + (feature.get("duration") or 0.0)
+        for key in order:
+            entry = merged[key]
+            scenarios = entry["scenarios"]
+            if not scenarios:
+                continue
+            worst = max(
+                (str(s.get("status", "untested")) for s in scenarios),
+                key=lambda s: severity.get(s, 0),
+            )
+            entry["status"] = worst if worst in severity else "untested"
+        return [merged[k] for k in order]
 
     def _compute_statistics(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         """Compute aggregate statistics from merged feature dicts."""
@@ -617,7 +826,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         if cwd:
             env["cwd"] = cwd
 
-        cmd = " ".join(sys.argv)
+        cmd = _sanitize_command(" ".join(sys.argv))
         if cmd:
             env["command"] = cmd
 
@@ -661,7 +870,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         if git_info.get("commit"):
             env["gitCommit"] = git_info["commit"]
         if git_info.get("remote"):
-            env["gitRemote"] = git_info["remote"]
+            env["gitRemote"] = _sanitize_url(git_info["remote"])
 
         return env
 
@@ -670,15 +879,20 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         import uuid
         from datetime import UTC, datetime
 
-        now = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-        total_duration = sum(r.duration for r in results)
+        started_at = getattr(self, "_exec_started_at", None)
+        ended_at = getattr(self, "_exec_ended_at", None) or datetime.now(UTC)
+        if started_at is None:
+            started_at = ended_at
+        wall_duration = getattr(self, "_exec_wall_duration", None)
+        if wall_duration is None:
+            wall_duration = sum(r.duration for r in results)
         any_failed = any(r.failed for r in results)
 
         execution: dict[str, Any] = {
             "executionId": f"exec-{uuid.uuid4().hex}",
             "status": "failed" if any_failed else "passed",
-            "duration": round(total_duration, 6),
-            "startTime": now,
-            "endTime": now,
+            "duration": round(wall_duration, 6),
+            "startTime": started_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "endTime": ended_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         }
         return execution

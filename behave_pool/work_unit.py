@@ -24,6 +24,11 @@ class WorkUnit:
         scenario_line: Line number of the scenario within the feature file.
             None when the work unit represents an entire feature.
         tags: Tags associated with the scenario or feature.
+        serial_mode: Which scenarios of the feature to run: ``"all"``
+            (default, whole feature), ``"only"`` (only ``@serial``
+            scenarios), or ``"exclude"`` (all except ``@serial``).
+            Used to split a mixed feature into a parallel and a serial
+            work unit.
     """
 
     id: str
@@ -31,6 +36,7 @@ class WorkUnit:
     feature_path: str | None = None
     scenario_line: int | None = None
     tags: list[str] = field(default_factory=list)
+    serial_mode: str = "all"
 
     @property
     def is_serial(self) -> bool:
