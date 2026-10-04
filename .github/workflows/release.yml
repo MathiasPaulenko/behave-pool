@@ -89,7 +89,7 @@ jobs:
           name: dist
           path: dist/
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3.0.2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: "v${{ needs.build.outputs.version }}"
           generate_release_notes: true
