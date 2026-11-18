@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-18
+
+### Fixed
+
+- `run_with_shard()` read `config.features_dir`, which does not exist on
+  behave's `Configuration`; it now uses `ShardConfig.features_dir`, so
+  sharding works with a real configuration object.
+- The `behave-pool` CLI did not detect the short `-r` flag, so a custom
+  runner passed as `-r some.module:Runner` was silently ignored and
+  `ParallelRunner` was forced anyway.
+- `--parallel-scheme` and `--parallel-balance` now declare argparse
+  `choices`, and values supplied via `-D pool.scheme=…` /
+  `-D pool.balance=…` userdata are validated with a clean `ConfigError`
+  instead of failing later with a raw traceback.
+- Non-integer shard indices and totals (including `bool`), malformed
+  shard strings with non-string input, and duplicate work-unit ids now
+  raise a clean `ShardError` instead of late `TypeError`s or ambiguous
+  shard assignments.
+- Timing keys are truncated at the last `.feature` marker, so features
+  inside a directory whose name contains `.feature` keep their correct
+  path and are no longer misidentified by `prune_stale()`.
+- Concurrent behave-pool runs in the same working directory no longer
+  share or delete each other's partial worker reports: every run stamps
+  a random token into the `worker_*.json` names under
+  `<report_dir>/tmp/` and the coordinator only cleans up its own files.
+- Worker temporary reports are now anchored to the `--parallel-report`
+  directory instead of the worker's cwd, matching the coordinator's
+  cleanup and avoiding orphaned `tmp/` directories when the report path
+  points outside the working directory.
+- A `before_all` hook failure inside a worker is no longer swallowed:
+  behave's `run_hook()` records `hook_failures`/`aborted` instead of
+  raising, and the per-unit state reset erased that signal, so a crashed
+  setup could pass the whole run. The state is now preserved across work
+  units and reported as a failure.
+- `after_all` hook failures and `runner.setup()` crashes are now
+  surfaced as synthetic `WorkerResult` entries that are drained after
+  worker shutdown, so they fail the run instead of being lost.
+- `WorkerProcess.terminate()` now joins the worker, and the result/task
+  queues are closed with their feeder threads joined after collection,
+  avoiding zombie processes and leaked resources.
+- `filter_serial_scenarios()` rejects unknown `serial_mode` values
+  instead of silently treating them as `"exclude"`.
+- `_sanitize_command()` also masks the attached spellings `-Dkey=value`
+  and `--define=key=value`, closing a credential leak into the JSON
+  report's `environment.command` field.
+- Non-string `parallel_report`/`parallel_timing_file` values are coerced
+  before building paths, and missing parent directories of the unified
+  report are created automatically.
+- `ConfigSnapshot.tag_expression_protocol` is now correctly typed as
+  `TagExpressionProtocol | None`.
+
 ## [1.3.0] - 2026-10-04
 
 ### Added
