@@ -78,7 +78,7 @@ def parse_shard_string(value: str) -> ShardConfig:
     Raises:
         ShardError: If the string is malformed or values are out of range.
     """
-    match = _SHARD_RE.match(value.strip())
+    match = _SHARD_RE.match(str(value).strip())
     if not match:
         msg = f"Invalid shard format {value!r}. Expected 'INDEX/TOTAL' (e.g. '1/3')."
         raise ShardError(msg)
@@ -97,8 +97,13 @@ def validate_shard(shard_index: int, total_shards: int) -> None:
         total_shards: Total number of shards.
 
     Raises:
-        ShardError: If ``total_shards`` < 1 or ``shard_index`` is out of range.
+        ShardError: If ``total_shards`` < 1, ``shard_index`` is out of range,
+            or either value is not an int.
     """
+    for name, value in (("shard_index", shard_index), ("total_shards", total_shards)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            msg = f"{name} must be an int, got {value!r}"
+            raise ShardError(msg)
     if total_shards < 1:
         msg = f"total_shards must be >= 1, got {total_shards}"
         raise ShardError(msg)
@@ -158,6 +163,9 @@ def select_shard_work_units(
         Work units assigned to the requested shard, in input order.
     """
     sorted_units = sorted(work_units, key=lambda u: u.id)
+    if len({u.id for u in sorted_units}) != len(sorted_units):
+        msg = "Duplicate work unit ids; shard assignment would be ambiguous."
+        raise ShardError(msg)
     selected = split_shards(sorted_units, shard_index, total_shards)
     selected_ids = {id(u) for u in selected}
     return [u for u in work_units if id(u) in selected_ids]

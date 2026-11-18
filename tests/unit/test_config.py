@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from behave_pool.config import ConfigSnapshot, add_parallel_options, snapshot_config
 
 
@@ -430,3 +432,81 @@ class TestUserdataFallback:
         config = self._bare_config({"pool.balance": MagicMock()})
         add_parallel_options(config)
         assert config.parallel_balance == "lpt"
+
+
+class TestOptionValidation:
+    """Regression: invalid scheme/balance must fail fast with ConfigError
+    instead of crashing deep inside the run or silently degrading."""
+
+    def _config(self, **overrides: object) -> MagicMock:
+        config = MagicMock()
+        config.jobs = 1
+        config.shard = None
+        config.userdata = {}
+        config.parallel_scheme = "feature"
+        config.parallel_balance = "lpt"
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def test_invalid_explicit_scheme_raises(self) -> None:
+        from behave.exception import ConfigError
+
+        config = self._config(parallel_scheme="bogus")
+        with pytest.raises(ConfigError, match="parallel_scheme"):
+            add_parallel_options(config)
+
+    def test_invalid_userdata_scheme_raises(self) -> None:
+        from behave.exception import ConfigError
+
+        config = self._config()
+        config.userdata = {"pool.scheme": "bogus"}
+        del config.parallel_scheme
+        with pytest.raises(ConfigError, match="parallel_scheme"):
+            add_parallel_options(config)
+
+    def test_invalid_explicit_balance_raises(self) -> None:
+        from behave.exception import ConfigError
+
+        config = self._config(parallel_balance="bogus")
+        with pytest.raises(ConfigError, match="parallel_balance"):
+            add_parallel_options(config)
+
+    def test_invalid_userdata_balance_raises(self) -> None:
+        from behave.exception import ConfigError
+
+        config = self._config()
+        config.userdata = {"pool.balance": "bogus"}
+        del config.parallel_balance
+        with pytest.raises(ConfigError, match="parallel_balance"):
+            add_parallel_options(config)
+
+    def test_valid_choices_accepted(self) -> None:
+        config = self._config(parallel_scheme="scenario", parallel_balance="fifo")
+        add_parallel_options(config)
+        assert config.parallel_scheme == "scenario"
+        assert config.parallel_balance == "fifo"
+
+    def test_jobs_string_coerced_to_int(self) -> None:
+        config = self._config()
+        config.jobs = "4"
+        add_parallel_options(config)
+        assert config.parallel == 4
+
+    def test_jobs_float_truncated_to_int(self) -> None:
+        config = self._config()
+        config.jobs = 2.9
+        add_parallel_options(config)
+        assert config.parallel == 2
+
+    def test_jobs_garbage_falls_back_to_sequential(self) -> None:
+        config = self._config()
+        config.jobs = "abc"
+        add_parallel_options(config)
+        assert config.parallel == 1
+
+    def test_jobs_negative_becomes_sequential(self) -> None:
+        config = self._config()
+        config.jobs = -3
+        add_parallel_options(config)
+        assert config.parallel == 1

@@ -44,7 +44,11 @@ def _sanitize_url(url: str) -> str:
 
 
 def _sanitize_command(cmd: str) -> str:
-    """Mask ``-D key=value`` values whose key looks like a credential."""
+    """Mask ``-D key=value`` values whose key looks like a credential.
+
+    Covers every argparse spelling: ``-D key=v``, ``-Dkey=v``,
+    ``--define key=v`` and ``--define=key=v``.
+    """
     import re as _re
 
     def _mask(match: _re.Match[str]) -> str:
@@ -53,7 +57,7 @@ def _sanitize_command(cmd: str) -> str:
             return f"{match.group(1)}{key}=***"
         return match.group(0)
 
-    return _re.sub(r"(-D\s+|--define\s+)([^\s=]+)=\S+", _mask, cmd)
+    return _re.sub(r"(-D\s*|--define[\s=])([^\s=]+)=\S+", _mask, cmd)
 
 
 # Per-work-unit timeout in seconds.  If no result arrives for a pending
@@ -84,6 +88,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         self._exec_started_at: Any = None
         self._exec_ended_at: Any = None
         self._exec_wall_duration: float | None = None
+        self._report_token = ""
 
     def run(self) -> bool:
         """Run the test suite — parallel or sequential depending on config."""
@@ -128,6 +133,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
 
     def _run_parallel(self) -> bool:
         """Execute the parallel pipeline: plan -> shard -> split -> dispatch -> collect."""
+        import secrets
         from datetime import UTC, datetime
 
         ctx = multiprocessing.get_context("spawn")
@@ -135,6 +141,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         result_queue: Any = ctx.Queue()
         stop_event: Any = ctx.Event()
 
+        self._report_token = secrets.token_hex(6)
         self._exec_started_at = datetime.now(UTC)
         started = time.monotonic()
         self._early_results = []
@@ -153,6 +160,12 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             stop_event.set()
             task_queue.close()
             result_queue.close()
+            # Wait for the queues' feeder threads so buffered results are
+            # flushed and no resource warnings leak at interpreter exit.
+            with contextlib.suppress(Exception):
+                task_queue.join_thread()
+            with contextlib.suppress(Exception):
+                result_queue.join_thread()
 
     def _plan(self) -> list[WorkUnit]:
         """Parse features and create work units.
@@ -270,7 +283,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         timing_file = (
             getattr(self.config, "parallel_timing_file", None) or ".behave-pool-timing.json"
         )
-        store = TimingStore(path=Path(timing_file))
+        store = TimingStore(path=Path(str(timing_file)))
         store.load()
         return sorted(units, key=lambda u: store.get_duration(u.id), reverse=True)
 
@@ -312,7 +325,9 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         Returns:
             List of work units that were actually enqueued (dispatched).
         """
-        config_snapshot = snapshot_config(self.config)
+        from dataclasses import replace
+
+        config_snapshot = replace(snapshot_config(self.config), report_token=self._report_token)
         dispatched: list[WorkUnit] = []
 
         # -- Phase 1: parallel batch with N workers.
@@ -490,6 +505,19 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             results.append(result)
             received_ids.add(result.work_unit_id)
 
+        # Workers are already joined at this point — drain synthetic results
+        # (e.g. "teardown" hook failures) that are not part of ``work_units``.
+        while not result_queue.empty():
+            try:
+                result = result_queue.get_nowait()
+            except (queue.Empty, EOFError, OSError):
+                break
+            if result.work_unit_id in received_ids:
+                continue
+            results.append(result)
+            received_ids.add(result.work_unit_id)
+            self._print_progress(result)
+
         # Detect missing results from crashed or timed-out workers.
         missing = [u.id for u in work_units if u.id not in received_ids]
         if missing:
@@ -553,7 +581,7 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             getattr(self.config, "parallel_timing_file", None) or ".behave-pool-timing.json"
         )
         try:
-            store = TimingStore(path=Path(timing_file))
+            store = TimingStore(path=Path(str(timing_file)))
             store.load()
             for result in results:
                 store.update(result.work_unit_id, result.duration)
@@ -614,9 +642,10 @@ class ParallelRunner(Runner):  # type: ignore[misc]
         }
 
         report_path = Path(
-            getattr(self.config, "parallel_report", None) or "behave-pool-report.json"
+            str(getattr(self.config, "parallel_report", None) or "behave-pool-report.json")
         )
         try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(
                 json.dumps(report, indent=2, ensure_ascii=False),
                 encoding="utf-8",
@@ -626,9 +655,14 @@ class ParallelRunner(Runner):  # type: ignore[misc]
             logger.warning("Failed to write unified report to %s", report_path)
             statistics = None
 
-        tmp_dir = Path("tmp")
+        # Workers write partial reports under <report_dir>/tmp/ (matching
+        # WorkerRunner._write_report).  The run-scoped token in the filename
+        # keeps concurrent behave-pool runs in the same directory from
+        # deleting each other's in-flight reports.
+        tmp_dir = report_path.parent / "tmp"
+        tmp_glob = f"worker_{self._report_token}_*.json" if self._report_token else "worker_*.json"
         if tmp_dir.is_dir():
-            for report_file in tmp_dir.glob("worker_*.json"):
+            for report_file in tmp_dir.glob(tmp_glob):
                 with contextlib.suppress(OSError):
                     report_file.unlink()
             if not any(tmp_dir.iterdir()):

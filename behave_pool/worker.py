@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import multiprocessing
@@ -49,14 +50,23 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
         worker_id: int,
         result_queue: QueueType[WorkerResult],
         stop_event: Any,
+        report_token: str = "",
     ) -> None:
         super().__init__(config)
         self.worker_id = worker_id
         self.result_queue = result_queue
         self.stop_event = stop_event
+        self._report_token = report_token
         self._last_result: WorkerResult | None = None
         self._setup_done = False
+        # before_all hook failures abort the runner (behave semantics); the
+        # flag is kept per-worker so per-unit state resets cannot erase it.
+        self._setup_hook_failed = False
         self.base_dir = config.base_dir if getattr(config, "base_dir", None) else "features"
+        # Anchor the tmp report dir to the coordinator's cwd at worker
+        # startup — before_any/environment hooks could chdir() later.
+        report_cfg = getattr(config, "parallel_report", None) or "behave-pool-report.json"
+        self._report_dir = (Path(str(report_cfg)).parent / "tmp").resolve()
 
     def load_hooks(self, filename: str | None = None) -> None:
         """Load environment hooks from the environment file."""
@@ -91,6 +101,9 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
         self.load_step_definitions()
         self.context = Context(self)
         self.run_hook("before_all")
+        # run_hook swallows hook exceptions and records hook_failures +
+        # aborted instead — capture that state before per-unit resets.
+        self._setup_hook_failed = self.hook_failures > 0 or self.aborted
         self._setup_done = True
         logger.debug("WorkerRunner %d setup complete", self.worker_id)
 
@@ -123,10 +136,11 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
                     filter_scenario_by_line(feature, unit.scenario_line)
             self.undefined_steps.clear()
             self.hook_failures = 0
-            if self.context is not None:
-                # aborted lives on the Context created in setup()
+            if self.context is not None and not self._setup_hook_failed:
+                # aborted lives on the Context created in setup(); keep it
+                # when before_all already aborted the run.
                 self.aborted = False
-            failed = self._run_features()
+            failed = self._run_features() or self._setup_hook_failed
             duration = time.perf_counter() - start
             undefined = list(self.undefined_steps)
             report_path = self._write_report(unit)
@@ -350,11 +364,14 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
         Returns:
             Path to the report file, or None if writing failed.
         """
-        tmp_dir = Path("tmp")
+        tmp_dir = self._report_dir
         safe_id = unit.id.replace(":", "_").replace("/", "_").replace("\\", "_")
-        report_path = tmp_dir / f"worker_{self.worker_id}_{safe_id}.json"
+        # The run token scopes the file name so two behave-pool processes in
+        # the same directory cannot overwrite or delete each other's reports.
+        prefix = f"worker_{self._report_token}" if self._report_token else "worker"
+        report_path = tmp_dir / f"{prefix}_{self.worker_id}_{safe_id}.json"
         try:
-            tmp_dir.mkdir(exist_ok=True)
+            tmp_dir.mkdir(parents=True, exist_ok=True)
             report_data = {
                 "worker_id": self.worker_id,
                 "work_unit_id": unit.id,
@@ -373,6 +390,12 @@ class WorkerRunner(ModelRunner):  # type: ignore[misc]
 
 def _noop_hook(context: object) -> None:
     """Default no-op hook used when before_all is not defined."""
+
+
+def _put_safely(result_queue: Any, result: WorkerResult) -> None:
+    """Best-effort result send — the coordinator may already be gone."""
+    with contextlib.suppress(Exception):
+        result_queue.put(result)
 
 
 def _make_config(snapshot: ConfigSnapshot) -> Configuration:
@@ -430,21 +453,28 @@ def _worker_run_loop(
     - stop_event is set by the coordinator.
     """
     config = _make_config(config_snapshot)
-    runner = WorkerRunner(config, worker_id, result_queue, stop_event)
+    runner = WorkerRunner(
+        config,
+        worker_id,
+        result_queue,
+        stop_event,
+        report_token=getattr(config_snapshot, "report_token", ""),
+    )
     try:
         try:
             runner.setup()
         except Exception as exc:
             logger.exception("Worker %d: setup failed; stopping all workers.", worker_id)
             stop_event.set()
-            result_queue.put(
+            _put_safely(
+                result_queue,
                 WorkerResult(
                     worker_id=worker_id,
                     work_unit_id="setup",
                     failed=True,
                     duration=0.0,
                     error=f"Worker setup failed: {exc}",
-                )
+                ),
             )
             return
         while True:
@@ -467,7 +497,7 @@ def _worker_run_loop(
                 task_queue.task_done()
                 continue
             result = runner.run_work_unit(unit)
-            result_queue.put(result)
+            _put_safely(result_queue, result)
             task_queue.task_done()
             if result.failed and config.stop:
                 # -- STOP-ON-FAILURE: propagate --stop to other workers.
@@ -481,7 +511,37 @@ def _worker_run_loop(
                 )
                 break
     finally:
-        runner.teardown()
+        pre_teardown_failures = getattr(runner, "hook_failures", 0)
+        try:
+            runner.teardown()
+        except Exception as exc:
+            logger.exception("Worker %d: teardown failed.", worker_id)
+            _put_safely(
+                result_queue,
+                WorkerResult(
+                    worker_id=worker_id,
+                    work_unit_id="teardown",
+                    failed=True,
+                    duration=0.0,
+                    error=f"Worker teardown failed: {exc}",
+                ),
+            )
+        else:
+            with contextlib.suppress(TypeError):
+                delta = getattr(runner, "hook_failures", 0) - pre_teardown_failures
+                if isinstance(delta, (int, float)) and delta > 0:
+                    # run_hook() does not raise on after_all errors — surface
+                    # them as a synthetic result so the run still fails.
+                    _put_safely(
+                        result_queue,
+                        WorkerResult(
+                            worker_id=worker_id,
+                            work_unit_id="teardown",
+                            failed=True,
+                            duration=0.0,
+                            error="after_all hook failed",
+                        ),
+                    )
 
 
 class WorkerProcess:
@@ -545,4 +605,5 @@ class WorkerProcess:
         """
         if self._process is not None and self._process.is_alive():
             self._process.terminate()
+            self._process.join(timeout=5)
             logger.warning("Worker %d forcibly terminated.", self.worker_id)

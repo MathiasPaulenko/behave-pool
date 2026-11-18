@@ -52,6 +52,9 @@ def filter_serial_scenarios(feature: Feature, serial_mode: str) -> None:
     """
     if serial_mode == "all":
         return
+    if serial_mode not in ("only", "exclude"):
+        msg = f"Unknown serial_mode {serial_mode!r}; expected 'all', 'only' or 'exclude'."
+        raise ValueError(msg)
     _filter_container(feature, serial_mode)
 
 

@@ -742,3 +742,43 @@ class TestShardSortingConsistency:
                 f"Shard {shard_index}/3: sequential selected {seq_filenames}, "
                 f"parallel selected {par_filenames}"
             )
+
+
+class TestShardTypeValidation:
+    """Regression: non-int shard params must raise ShardError, not TypeError."""
+
+    @pytest.mark.parametrize("bad_index", ["1", 1.5, True, None])
+    def test_validate_shard_rejects_non_int_index(self, bad_index: object) -> None:
+        with pytest.raises(ShardError):
+            validate_shard(bad_index, 3)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad_total", ["3", 3.0, False, None])
+    def test_validate_shard_rejects_non_int_total(self, bad_total: object) -> None:
+        with pytest.raises(ShardError):
+            validate_shard(1, bad_total)  # type: ignore[arg-type]
+
+    def test_split_shards_rejects_string_index(self) -> None:
+        with pytest.raises(ShardError):
+            split_shards([1, 2, 3], "2", 3)  # type: ignore[arg-type]
+
+    def test_parse_shard_string_rejects_non_string(self) -> None:
+        """Non-string input must raise ShardError, not AttributeError."""
+        for bad in (None, 1.5, ["1/3"]):
+            with pytest.raises(ShardError):
+                parse_shard_string(bad)  # type: ignore[arg-type]
+
+    def test_select_shard_work_units_rejects_duplicate_ids(self) -> None:
+        """Duplicate work unit ids would make shard membership ambiguous."""
+        snap = ConfigSnapshot(
+            base_dir="features",
+            steps_dir="steps",
+            environment_file="environment.py",
+            lang=None,
+            stop=False,
+        )
+        units = [
+            WorkUnit(id="feature:a.feature", config=snap, feature_path="a.feature"),
+            WorkUnit(id="feature:a.feature", config=snap, feature_path="a.feature"),
+        ]
+        with pytest.raises(ShardError, match="Duplicate work unit ids"):
+            select_shard_work_units(units, 1, 2)

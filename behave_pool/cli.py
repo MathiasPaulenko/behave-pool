@@ -42,10 +42,7 @@ def main(args: list[str] | None = None) -> int:
         args_list = list(args) if args is not None else sys.argv[1:]
         config = Configuration(args_list)
         runner_class = None
-        user_runner_given = any(
-            a == "--runner" or a.startswith("--runner=") or a.startswith("--runner:")
-            for a in args_list
-        )
+        user_runner_given = any(a.startswith("--runner") or a.startswith("-r") for a in args_list)
         if config.runner == DEFAULT_RUNNER_CLASS_NAME and not user_runner_given:
             runner_class = behave_pool.ParallelRunner
         return int(run_behave(config, runner_class=runner_class))

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from behave.configuration import Configuration
+    from behave.tag_expression import TagExpressionProtocol
 
 
 def _register_parallel_options() -> None:
@@ -25,6 +26,7 @@ def _register_parallel_options() -> None:
                 {
                     "dest": "parallel_scheme",
                     "default": "feature",
+                    "choices": ["feature", "scenario"],
                     "help": "Parallelization scheme: feature (default: %(default)s).",
                 },
             ),
@@ -122,6 +124,20 @@ def _resolve_option(config: Configuration, attr: str, default: Any, userdata_nam
     return default if value is None else value
 
 
+def _validate_choice(name: str, value: Any, choices: tuple[str, ...]) -> None:
+    """Reject option strings outside the allowed set (e.g. via userdata).
+
+    Non-string values are ignored: the CLI/ini paths already validate via
+    argparse ``choices``, and test doubles (e.g. ``MagicMock``) must not
+    be mistaken for user input.
+    """
+    if isinstance(value, str) and value not in choices:
+        from behave.exception import ConfigError
+
+        msg = f"Invalid {name} value {value!r}; expected one of: {', '.join(choices)}"
+        raise ConfigError(msg)
+
+
 @dataclass(frozen=True)
 class ConfigSnapshot:
     """Picklable snapshot of essential Configuration fields for worker processes.
@@ -149,9 +165,10 @@ class ConfigSnapshot:
     tags: list[str] | str | None = None
     config_tags: str | list[str] | None = None
     default_tags: str | None = None
-    tag_expression_protocol: str | None = None
+    tag_expression_protocol: TagExpressionProtocol | None = None
     name: list[str] | None = None
     userdata: dict[str, Any] = field(default_factory=dict)
+    report_token: str = ""
 
 
 def snapshot_config(config: Configuration) -> ConfigSnapshot:
@@ -220,10 +237,15 @@ def add_parallel_options(config: Configuration) -> None:
 
             with contextlib.suppress(TypeError, ValueError):
                 jobs = int(str(userdata_jobs))
-    config.parallel = jobs if jobs else 1
+    try:
+        config.parallel = max(int(jobs), 1) if jobs else 1
+    except (TypeError, ValueError):
+        config.parallel = 1
 
     config.parallel_scheme = _resolve_option(config, "parallel_scheme", "feature", "scheme")
+    _validate_choice("parallel_scheme", config.parallel_scheme, ("feature", "scenario"))
     config.parallel_balance = _resolve_option(config, "parallel_balance", "lpt", "balance")
+    _validate_choice("parallel_balance", config.parallel_balance, ("lpt", "fifo"))
     config.parallel_timing_file = _resolve_option(
         config, "parallel_timing_file", ".behave-pool-timing.json", "timing_file"
     )

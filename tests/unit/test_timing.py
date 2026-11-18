@@ -265,3 +265,49 @@ class TestSaveErrorHandling:
         ):
             store.save({"u1": 1.0})
         assert not timing_file.exists()
+
+
+class TestWorkUnitFeaturePath:
+    """Regression: _work_unit_feature_path must not truncate at the first
+    '.feature' occurrence — directories may legitimately contain it."""
+
+    def test_directory_containing_dot_feature(self) -> None:
+        from behave_pool.timing import _work_unit_feature_path
+
+        result = _work_unit_feature_path("feature:my.feature.dir/login.feature")
+        assert result == "my.feature.dir/login.feature"
+
+    def test_serial_suffix_stripped(self) -> None:
+        from behave_pool.timing import _work_unit_feature_path
+
+        result = _work_unit_feature_path("feature:a.feature/b.feature#serial")
+        assert result == "a.feature/b.feature"
+
+    def test_scenario_prefix_with_line(self) -> None:
+        from behave_pool.timing import _work_unit_feature_path
+
+        result = _work_unit_feature_path("scenario:dir/x.feature:12")
+        assert result == "dir/x.feature"
+
+    def test_unknown_prefix_returns_none(self) -> None:
+        from behave_pool.timing import _work_unit_feature_path
+
+        assert _work_unit_feature_path("setup") is None
+
+    def test_store_accepts_string_path(self, tmp_path: Path) -> None:
+        """TimingStore must accept plain strings, not only Path objects."""
+        target = str(tmp_path / "t.json")
+        store = TimingStore(path=target)  # type: ignore[arg-type]
+        store.save({"u1": 1.0})
+        assert Path(target).exists()
+
+
+class TestSerialModeValidation:
+    def test_filter_rejects_unknown_serial_mode(self) -> None:
+        """An invalid serial_mode must raise instead of silently filtering."""
+        from unittest.mock import MagicMock
+
+        from behave_pool.serial import filter_serial_scenarios
+
+        with pytest.raises(ValueError, match="serial_mode"):
+            filter_serial_scenarios(MagicMock(), "bogus")

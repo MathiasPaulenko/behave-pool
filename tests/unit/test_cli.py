@@ -52,6 +52,30 @@ class TestMain:
             behave_pool.cli.main(["--runner", "behave.runner:Runner", "features/"])
         assert mock_run.call_args[1]["runner_class"] is None
 
+    def test_main_respects_short_runner_flag(self) -> None:
+        """-r is behave's short spelling of --runner and must not be overridden.
+
+        Regression: an explicit ``-r behave.runner:Runner`` was previously
+        ignored, so ParallelRunner was injected against the user's choice.
+        """
+        import behave_pool.cli
+
+        with patch("behave.__main__.run_behave", return_value=0) as mock_run:
+            behave_pool.cli.main(["-r", "behave.runner:Runner", "features/"])
+        assert mock_run.call_args[1]["runner_class"] is None
+
+    def test_main_respects_attached_runner_value(self) -> None:
+        """-r<value> and --runner=<value> spellings must also be respected."""
+        import behave_pool.cli
+
+        for args in (
+            ["-rbehave.runner:Runner", "features/"],
+            ["--runner=behave.runner:Runner", "features/"],
+        ):
+            with patch("behave.__main__.run_behave", return_value=0) as mock_run:
+                behave_pool.cli.main(args)
+            assert mock_run.call_args[1]["runner_class"] is None
+
     def test_main_invalid_args_raise_system_exit(self) -> None:
         """Unrecognized args exit like behave's own CLI (SystemExit)."""
         import pytest

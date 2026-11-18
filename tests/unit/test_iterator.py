@@ -242,3 +242,30 @@ class TestScenarioIterator:
         units = list(ScenarioIterator(features, mock_config).iterate())
         assert len(units) == 4  # 2 scenarios each
         assert all(not u.is_serial for u in units)
+
+
+class TestScenarioIteratorRules:
+    """ScenarioIterator must flatten scenarios nested inside Rules."""
+
+    def _parse(self, name: str):
+        from pathlib import Path
+
+        from behave.runner import parse_features
+
+        base = Path(__file__).parent.parent / "fixtures"
+        return parse_features([str(p) for p in base.rglob(name)])
+
+    def test_scenarios_inside_rules_produce_units(self, mock_config: MagicMock) -> None:
+        features = self._parse("rules_and_outlines.feature")
+        units = list(ScenarioIterator(features, mock_config).iterate())
+        # Mixed rule: 2 scenarios + 1 outline; serial rule: 1 scenario.
+        assert len(units) == 4
+        assert len({u.id for u in units}) == 4
+
+    def test_serial_units_detected_inside_rules(self, mock_config: MagicMock) -> None:
+        features = self._parse("rules_and_outlines.feature")
+        units = list(ScenarioIterator(features, mock_config).iterate())
+        serial = [u for u in units if u.is_serial]
+        # 'serial inside rule' + 'Mixed examples' outline (serial row)
+        # + 'serial rule child' (inherits the @serial rule tag).
+        assert len(serial) == 3

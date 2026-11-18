@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import queue
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -705,6 +707,49 @@ class TestWriteReportBackslash:
             assert "\\" not in filename
             assert filename == "worker_0_feature_features_login.feature.json"
 
+    def test_write_report_includes_run_token(self, worker_runner: WorkerRunner) -> None:
+        """Run-scoped token prefixes the tmp report file name so concurrent
+        behave-pool runs cannot collide or clean each other's files."""
+        from behave_pool.work_unit import WorkUnit
+
+        worker_runner._report_token = "tok9"
+        unit = WorkUnit(
+            id="feature:login.feature",
+            config=worker_runner.config,
+            feature_path="login.feature",
+        )
+        worker_runner.features = [
+            _make_mock_feature(name="Login", filename="login.feature", status="passed")
+        ]
+
+        with patch.object(Path, "mkdir"), patch.object(Path, "write_text"):
+            result = worker_runner._write_report(unit)
+        assert result is not None
+        assert Path(result).name == "worker_tok9_0_feature_login.feature.json"
+
+    def test_write_report_anchors_tmp_to_report_parent(
+        self, worker_runner: WorkerRunner, tmp_path: Path
+    ) -> None:
+        """tmp reports are written next to the parallel report path,
+        absolute-anchored at worker init so hooks cannot break the path
+        with a later chdir()."""
+        from behave_pool.work_unit import WorkUnit
+
+        worker_runner._report_dir = tmp_path / "out" / "tmp"
+        unit = WorkUnit(
+            id="feature:login.feature",
+            config=worker_runner.config,
+            feature_path="login.feature",
+        )
+        worker_runner.features = [
+            _make_mock_feature(name="Login", filename="login.feature", status="passed")
+        ]
+
+        result = worker_runner._write_report(unit)
+        assert result is not None
+        assert Path(result).parent == tmp_path / "out" / "tmp"
+        assert Path(result).exists()
+
 
 class TestLoadStepDefinitionsNested:
     """Regression test for load_step_definitions with use_nested_step_modules."""
@@ -903,6 +948,109 @@ class TestRunWorkUnitEmptyFeaturePath:
         result = worker_runner.run_work_unit(unit)
         assert result.failed is True
         assert result.error is not None
+
+
+class TestSetupHookFailures:
+    """Regression: run_hook() swallows exceptions — before_all failures set
+    hook_failures/aborted at setup() and must not be erased by per-unit
+    state resets."""
+
+    def test_before_all_failure_marks_unit_failed(
+        self, worker_runner: WorkerRunner, sample_work_unit: WorkUnit
+    ) -> None:
+        worker_runner._setup_hook_failed = True
+        worker_runner.context = MagicMock()
+        with (
+            patch("behave_pool.worker.parse_features", return_value=[]),
+            patch.object(worker_runner, "_run_features", return_value=False),
+        ):
+            result = worker_runner.run_work_unit(sample_work_unit)
+        assert result.failed is True
+
+    def test_before_all_failure_preserves_aborted(
+        self, worker_runner: WorkerRunner, sample_work_unit: WorkUnit
+    ) -> None:
+        """aborted set by a failing before_all must NOT be reset per unit."""
+        worker_runner._setup_hook_failed = True
+        context = MagicMock()
+        context.aborted = True
+        worker_runner.context = context
+        with (
+            patch("behave_pool.worker.parse_features", return_value=[]),
+            patch.object(worker_runner, "_run_features", return_value=True),
+        ):
+            worker_runner.run_work_unit(sample_work_unit)
+        context._set_root_attribute.assert_not_called()
+
+    def test_clean_setup_resets_aborted_normally(
+        self, worker_runner: WorkerRunner, sample_work_unit: WorkUnit
+    ) -> None:
+        worker_runner.context = MagicMock()
+        with (
+            patch("behave_pool.worker.parse_features", return_value=[]),
+            patch.object(worker_runner, "_run_features", return_value=False),
+        ):
+            worker_runner.run_work_unit(sample_work_unit)
+        worker_runner.context._set_root_attribute.assert_called_with("aborted", False)
+
+
+class TestWorkerLoopTeardownResult:
+    """Regression: after_all/teardown failures were silently lost — the
+    worker must emit a synthetic 'teardown' result so the run fails."""
+
+    def _loop(self, runner: MagicMock, task_q: object, result_q: object) -> None:
+        from behave_pool.config import ConfigSnapshot
+        from behave_pool.worker import _worker_run_loop
+
+        snapshot = ConfigSnapshot(
+            base_dir="features",
+            steps_dir="steps",
+            environment_file="environment.py",
+            lang=None,
+            stop=False,
+        )
+        with (
+            patch("behave_pool.worker._make_config", return_value=MagicMock()),
+            patch("behave_pool.worker.WorkerRunner", return_value=runner),
+        ):
+            _worker_run_loop(0, task_q, result_q, MagicMock(), snapshot)
+
+    def test_teardown_hook_failure_emits_result(self) -> None:
+        task_q: Any = queue.Queue()
+        task_q.put(None)  # sentinel — worker goes straight to teardown
+        result_q: Any = queue.Queue()
+        runner = MagicMock()
+        runner.hook_failures = 0
+        runner.teardown.side_effect = lambda: setattr(runner, "hook_failures", 1)
+
+        self._loop(runner, task_q, result_q)
+
+        results = [result_q.get_nowait() for _ in range(result_q.qsize())]
+        assert any(r.work_unit_id == "teardown" and r.failed for r in results)
+
+    def test_teardown_exception_emits_result(self) -> None:
+        task_q: Any = queue.Queue()
+        task_q.put(None)
+        result_q: Any = queue.Queue()
+        runner = MagicMock()
+        runner.hook_failures = 0
+        runner.teardown.side_effect = RuntimeError("boom")
+
+        self._loop(runner, task_q, result_q)
+
+        results = [result_q.get_nowait() for _ in range(result_q.qsize())]
+        assert any(r.work_unit_id == "teardown" and "boom" in (r.error or "") for r in results)
+
+    def test_clean_teardown_emits_nothing(self) -> None:
+        task_q: Any = queue.Queue()
+        task_q.put(None)
+        result_q: Any = queue.Queue()
+        runner = MagicMock()
+        runner.hook_failures = 0
+
+        self._loop(runner, task_q, result_q)
+
+        assert result_q.empty()
 
 
 class TestWriteReportStatusEnum:

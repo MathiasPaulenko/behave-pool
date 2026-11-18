@@ -1068,6 +1068,34 @@ class TestDetectEnvironment:
         for key, value in env.items():
             assert value is not None, f"{key} should not be None"
 
+    def test_command_key_present(self, mock_config: MagicMock) -> None:
+        runner = ParallelRunner(mock_config)
+        env = runner._detect_environment()
+        assert env["command"]
+
+    def test_git_info_collected(self, mock_config: MagicMock) -> None:
+        runner = ParallelRunner(mock_config)
+        proc = MagicMock(returncode=0, stdout="main\n")
+        with patch("subprocess.run", return_value=proc):
+            env = runner._detect_environment()
+        assert env["gitBranch"] == "main"
+        assert env["gitCommit"] == "main"
+        assert env["gitRemote"] == "main"
+
+    def test_git_failure_ignored(self, mock_config: MagicMock) -> None:
+        runner = ParallelRunner(mock_config)
+        with patch("subprocess.run", side_effect=OSError("no git")):
+            env = runner._detect_environment()
+        assert "gitBranch" not in env
+
+    def test_github_actions_detected(self, mock_config: MagicMock) -> None:
+        import os
+
+        runner = ParallelRunner(mock_config)
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=False):
+            env = runner._detect_environment()
+        assert env["ciProvider"] == "github-actions"
+
 
 class TestBuildExecution:
     """Tests for ParallelRunner._build_execution."""
@@ -1126,3 +1154,246 @@ class TestBuildExecution:
         ]
         execution = runner._build_execution(results)
         assert execution["duration"] == 3.5
+
+
+class TestSanitizeCommand:
+    """Regression: credential-looking -D/--define values must be masked in
+    every argparse spelling, including attached ones (-Dk=v, --define=k=v)."""
+
+    def test_masks_attached_short_define(self) -> None:
+        from behave_pool.runner import _sanitize_command
+
+        out = _sanitize_command("behave -Dapi_token=secret123 features/")
+        assert "secret123" not in out
+        assert "-Dapi_token=***" in out
+
+    def test_masks_attached_long_define(self) -> None:
+        from behave_pool.runner import _sanitize_command
+
+        out = _sanitize_command("behave --define=db_password=pw features/")
+        assert "pw" not in out
+        assert "--define=db_password=***" in out
+
+    def test_masks_separated_forms(self) -> None:
+        from behave_pool.runner import _sanitize_command
+
+        out = _sanitize_command("behave -D password=x --define token=y features/")
+        assert "-D password=***" in out
+        assert "--define token=***" in out
+        assert "=x" not in out and "=y" not in out
+
+    def test_non_sensitive_keys_left_untouched(self) -> None:
+        from behave_pool.runner import _sanitize_command
+
+        cmd = "behave -Dbrowser=chrome --define env=staging -D region=eu"
+        assert _sanitize_command(cmd) == cmd
+
+    def test_unrelated_flags_not_touched(self) -> None:
+        from behave_pool.runner import _sanitize_command
+
+        cmd = "behave --dry-run -t fast features/"
+        assert _sanitize_command(cmd) == cmd
+
+
+class TestMergeReportsTmpIsolation:
+    """Regression: two behave-pool runs in the same directory must not
+    delete each other's in-flight tmp reports (run-scoped token)."""
+
+    def test_cleanup_removes_only_own_token_files(
+        self, mock_config: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_config.parallel_report = str(tmp_path / "report.json")
+        runner = ParallelRunner(mock_config)
+        runner._report_token = "tok123"
+
+        tmp_dir = tmp_path / "tmp"
+        tmp_dir.mkdir()
+        own = tmp_dir / "worker_tok123_0_feature_a.json"
+        foreign = tmp_dir / "worker_otherrun_0_feature_b.json"
+        own.write_text('{"features": []}', encoding="utf-8")
+        foreign.write_text('{"features": []}', encoding="utf-8")
+
+        result = WorkerResult(
+            worker_id=0,
+            work_unit_id="feature:a.feature",
+            failed=False,
+            duration=0.1,
+            report_path=str(own),
+        )
+        statistics = runner._merge_reports([result])
+
+        assert statistics is not None
+        assert not own.exists()
+        assert foreign.exists()
+
+    def test_tmp_dir_anchored_to_report_parent(
+        self, mock_config: MagicMock, tmp_path: Path
+    ) -> None:
+        """tmp reports live next to the report file, not CWD."""
+        out_dir = tmp_path / "out"
+        mock_config.parallel_report = str(out_dir / "report.json")
+        runner = ParallelRunner(mock_config)
+        runner._report_token = "tok77"
+
+        tmp_dir = out_dir / "tmp"
+        tmp_dir.mkdir(parents=True)
+        own = tmp_dir / "worker_tok77_0_feature_a.json"
+        own.write_text('{"features": []}', encoding="utf-8")
+
+        result = WorkerResult(
+            worker_id=0,
+            work_unit_id="feature:a.feature",
+            failed=False,
+            duration=0.1,
+            report_path=str(own),
+        )
+        statistics = runner._merge_reports([result])
+
+        assert statistics is not None
+        assert (out_dir / "report.json").exists()
+        assert not own.exists()
+
+
+class TestCollectExtraResults:
+    """Regression: synthetic worker results ("teardown"/"setup" ids) arrive
+    after the last unit result — _collect must still drain and count them."""
+
+    def test_late_teardown_result_counts_as_failure(
+        self, mock_config: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_config.parallel_report = str(tmp_path / "report.json")
+        mock_config.parallel_timing_file = str(tmp_path / "timing.json")
+        runner = ParallelRunner(mock_config)
+        result_queue: Any = queue.Queue()
+        result_queue.put(WorkerResult(worker_id=0, work_unit_id="u1", failed=False, duration=0.1))
+        result_queue.put(
+            WorkerResult(
+                worker_id=0,
+                work_unit_id="teardown",
+                failed=True,
+                duration=0.0,
+                error="after_all hook failed",
+            )
+        )
+
+        result = runner._collect(result_queue, [MagicMock(id="u1")])
+        assert result is True
+
+    def test_late_teardown_success_does_not_fail(
+        self, mock_config: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_config.parallel_report = str(tmp_path / "report.json")
+        mock_config.parallel_timing_file = str(tmp_path / "timing.json")
+        runner = ParallelRunner(mock_config)
+        result_queue: Any = queue.Queue()
+        result_queue.put(WorkerResult(worker_id=0, work_unit_id="u1", failed=False, duration=0.1))
+        result_queue.put(
+            WorkerResult(worker_id=0, work_unit_id="teardown", failed=False, duration=0.0)
+        )
+
+        result = runner._collect(result_queue, [MagicMock(id="u1")], deadline_seconds=0.5)
+        assert result is False
+
+
+class TestSanitizeUrl:
+    def test_strips_embedded_credentials(self) -> None:
+        from behave_pool.runner import _sanitize_url
+
+        assert _sanitize_url("https://user:tok@gitlab.com/x.git") == "https://gitlab.com/x.git"
+
+    def test_keeps_urls_without_credentials(self) -> None:
+        from behave_pool.runner import _sanitize_url
+
+        assert _sanitize_url("https://gitlab.com/x.git") == "https://gitlab.com/x.git"
+
+    def test_non_url_unchanged(self) -> None:
+        from behave_pool.runner import _sanitize_url
+
+        assert _sanitize_url("git@host:path/repo.git") == "git@host:path/repo.git"
+        assert _sanitize_url("no-at-no-scheme") == "no-at-no-scheme"
+
+
+class TestShutdownWorkers:
+    def test_terminates_stuck_worker(self, mock_config: MagicMock) -> None:
+        runner = ParallelRunner(mock_config)
+        worker = MagicMock()
+        worker.is_alive.return_value = True
+        worker.worker_id = 3
+        runner._shutdown_workers([worker], MagicMock())
+        worker.terminate.assert_called_once()
+
+    def test_no_terminate_when_worker_exits(self, mock_config: MagicMock) -> None:
+        runner = ParallelRunner(mock_config)
+        worker = MagicMock()
+        worker.is_alive.return_value = False
+        runner._shutdown_workers([worker], MagicMock())
+        worker.terminate.assert_not_called()
+
+
+class TestDrainQueue:
+    def test_drains_all_items(self, mock_config: MagicMock) -> None:
+        runner = ParallelRunner(mock_config)
+        task_queue: Any = queue.Queue()
+        task_queue.put("a")
+        task_queue.put("b")
+        task_queue.put(None)
+        runner._drain_queue(task_queue)
+        assert task_queue.empty()
+
+    def test_empty_queue_noop(self, mock_config: MagicMock) -> None:
+        runner = ParallelRunner(mock_config)
+        task_queue: Any = queue.Queue()
+        runner._drain_queue(task_queue)
+        assert task_queue.empty()
+
+
+class TestMergeFeatureDicts:
+    def test_merges_same_filename_scenarios(self, mock_config: MagicMock) -> None:
+        merged = ParallelRunner._merge_feature_dicts(
+            [
+                {
+                    "filename": "a.feature",
+                    "status": "passed",
+                    "duration": 1.0,
+                    "scenarios": [{"name": "s1", "status": "passed"}],
+                },
+                {
+                    "filename": "a.feature",
+                    "status": "passed",
+                    "duration": 2.0,
+                    "scenarios": [{"name": "s2", "status": "failed"}],
+                },
+            ]
+        )
+        assert len(merged) == 1
+        assert merged[0]["duration"] == 3.0
+        assert merged[0]["status"] == "failed"
+        assert len(merged[0]["scenarios"]) == 2
+
+    def test_distinct_filenames_kept_separate(self, mock_config: MagicMock) -> None:
+        merged = ParallelRunner._merge_feature_dicts(
+            [
+                {"filename": "a.feature", "status": "passed", "scenarios": []},
+                {"filename": "b.feature", "status": "passed", "scenarios": []},
+            ]
+        )
+        assert len(merged) == 2
+
+    def test_unknown_scenario_status_becomes_untested(self, mock_config: MagicMock) -> None:
+        merged = ParallelRunner._merge_feature_dicts(
+            [
+                {
+                    "filename": "a.feature",
+                    "status": "passed",
+                    "duration": 0.0,
+                    "scenarios": [{"name": "s", "status": "mystery"}],
+                },
+            ]
+        )
+        assert merged[0]["status"] == "untested"
+
+    def test_fallback_key_when_no_filename(self, mock_config: MagicMock) -> None:
+        merged = ParallelRunner._merge_feature_dicts(
+            [{"id": "feat-x", "status": "passed", "scenarios": []}]
+        )
+        assert len(merged) == 1

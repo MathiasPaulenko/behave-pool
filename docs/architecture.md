@@ -65,7 +65,8 @@ each worker process.
 - Load hooks (`before_all`, `after_all`, etc.) from `environment.py`.
 - Load step definitions from the `steps/` directory.
 - Execute work units (parse + run features).
-- Write per-work-unit JSON reports to `tmp/`.
+- Write per-work-unit JSON reports to `<report_dir>/tmp/` (file names
+  include a per-run token so concurrent runs cannot collide).
 - Send `WorkerResult` objects back to the coordinator.
 
 **Lifecycle:**
@@ -202,7 +203,7 @@ Work units tagged `@serial` are separated for the serial phase.
 2. Check for missing results (worker crashes → treated as failures).
 3. Compute `any_failed = any(r.failed for r in results) or missing`.
 4. Update `.behave-pool-timing.json` with observed durations.
-5. Clean up `tmp/` directory.
+5. Clean up the `<report_dir>/tmp/` directory (own run's files only).
 6. Return `any_failed` (Behave convention: `True` = failure).
 
 ## Process isolation: why spawn?

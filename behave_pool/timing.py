@@ -24,8 +24,9 @@ def _work_unit_feature_path(work_unit_id: str) -> str | None:
         return None
     path = rest.partition("#")[0]
     marker = ".feature"
-    if marker in path:
-        path = path[: path.index(marker) + len(marker)]
+    idx = path.rfind(marker)
+    if idx != -1:
+        path = path[: idx + len(marker)]
     return path or None
 
 
@@ -42,7 +43,7 @@ class TimingStore:
     """
 
     def __init__(self, path: Path = Path(".behave-pool-timing.json")) -> None:
-        self.path = path
+        self.path = Path(path)
         self._data: dict[str, float] = {}
         self._loaded: bool = False
 
